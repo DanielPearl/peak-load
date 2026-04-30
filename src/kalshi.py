@@ -108,11 +108,18 @@ def fetch_kalshi_markets(cfg: Config) -> List[KalshiMarket]:
     prefix = cfg.region_meta["kalshi_series_prefix"]
     if cfg.kalshi_api_key_id and cfg.kalshi_private_key_path and HAS_CRYPTO:
         try:
-            return _fetch_kalshi_real(cfg, prefix)
+            real = _fetch_kalshi_real(cfg, prefix)
+            if real:
+                return real
+            log.info("Kalshi returned 0 markets for series %r — Kalshi may "
+                     "not yet list a peak-load series for this region.",
+                     prefix)
         except Exception as exc:  # noqa: BLE001
-            log.warning("Kalshi real fetch failed (%s); using synthetic", exc)
+            log.warning("Kalshi real fetch failed (%s)", exc)
     if not cfg.use_synthetic_when_missing:
         return []
+    log.info("falling back to synthetic Kalshi markets so the daily "
+             "pipeline produces complete output")
     return _synthetic_markets(cfg)
 
 
