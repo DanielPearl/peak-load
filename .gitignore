@@ -1,0 +1,29 @@
+.env
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+.venv/
+venv/
+env/
+
+# Local data dumps + model artifacts (recreated by training)
+data/*.db
+data/*.db-journal
+data/*.csv
+data/*.parquet
+models/*.pkl
+
+# Daily output files (these can be regenerated; don't bloat the repo)
+outputs/*.csv
+outputs/*.json
+
+# Notebook checkpoints
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# IDE
+.idea/
+.vscode/
+.DS_Store
