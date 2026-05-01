@@ -122,8 +122,12 @@ def build_features(panel: pd.DataFrame, target: str = "daily_peak_load_mw"
 
     out = out.dropna(subset=["target"])
     out = out.replace([np.inf, -np.inf], np.nan)
-    target_cols = {"target"}
-    feature_cols = [c for c in out.columns if c not in target_cols]
+    # Critical leakage guard: BOTH load columns are functions of each
+    # other (`net_peak_load_mw = daily_peak_load_mw − solar − wind`),
+    # so whichever isn't the target would leak the target into
+    # features. Drop the non-target load column unconditionally.
+    leakage_cols = {"target", "daily_peak_load_mw", "net_peak_load_mw"}
+    feature_cols = [c for c in out.columns if c not in leakage_cols]
     return out, feature_cols
 
 

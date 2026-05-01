@@ -111,16 +111,18 @@ def fetch_kalshi_markets(cfg: Config) -> List[KalshiMarket]:
             real = _fetch_kalshi_real(cfg, prefix)
             if real:
                 return real
-            log.info("Kalshi returned 0 markets for series %r — Kalshi may "
-                     "not yet list a peak-load series for this region.",
-                     prefix)
+            log.info("Kalshi returned 0 markets for series %r — Kalshi "
+                     "may not yet list a peak-load series for this "
+                     "region. Forecast still runs; watchlist will be "
+                     "empty until real markets list.", prefix)
         except Exception as exc:  # noqa: BLE001
             log.warning("Kalshi real fetch failed (%s)", exc)
-    if not cfg.use_synthetic_when_missing:
-        return []
-    log.info("falling back to synthetic Kalshi markets so the daily "
-             "pipeline produces complete output")
-    return _synthetic_markets(cfg)
+    # No synthetic-market fallback: the dashboard would otherwise
+    # show fake tickers (e.g. KXERCOTPL-SIM-66000) that don't exist
+    # on the actual exchange. Better to show an empty watchlist with
+    # the model's forecast + threshold probabilities than to surface
+    # tickers a user can paste into Kalshi and get no results.
+    return []
 
 
 def _fetch_kalshi_real(cfg: Config, series_prefix: str) -> List[KalshiMarket]:
@@ -203,37 +205,8 @@ def _fp_int(fp_value, legacy_value) -> int:
     return 0
 
 
-# --------------------------------------------------------------------------- #
-# Synthetic markets — for runs without real Kalshi credentials
-# --------------------------------------------------------------------------- #
-
-def _synthetic_markets(cfg: Config) -> List[KalshiMarket]:
-    """One synthetic market per threshold in the grid.
-
-    Prices are anchored on a Gaussian centered on the region's typical
-    peak — so high thresholds price low and vice versa. Volumes and
-    OIs are randomized but high enough to clear the bot's liquidity
-    floors so the signals layer can be exercised.
-    """
-    rng = np.random.default_rng(seed=int(time.time()))
-    avg_peak = (cfg.region_meta["summer_peak_mw"]
-                + cfg.region_meta["winter_peak_mw"]) / 2
-    market_sigma = avg_peak * 0.05   # arbitrary but plausible
-    out: List[KalshiMarket] = []
-    for thr in cfg.threshold_grid_mw:
-        from scipy.stats import norm
-        p = float(1 - norm.cdf((thr - avg_peak) / market_sigma))
-        # Add ±3pt noise so the model can find disagreements.
-        p_noise = max(0.01, min(0.99, p + rng.normal(0, 0.03)))
-        yes_cents = int(round(p_noise * 100))
-        out.append(KalshiMarket(
-            ticker=f"{cfg.region_meta['kalshi_series_prefix']}-SIM-{thr}",
-            yes_sub_title=f"Above {thr} MW",
-            threshold_mw=thr,
-            yes_ask_cents=yes_cents,
-            no_ask_cents=100 - yes_cents,
-            volume=int(rng.integers(100, 5000)),
-            open_interest=int(rng.integers(80, 4000)),
-            raw={"synthetic": True},
-        ))
-    return out
+# Synthetic-market fallback was removed — the dashboard was surfacing
+# made-up tickers like KXERCOTPL-SIM-66000 that didn't exist on the
+# real exchange. If Kalshi has no live peak-load series for the
+# region, the watchlist is now correctly empty until real markets
+# list. The forecast + threshold probabilities still produce.

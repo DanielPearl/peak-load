@@ -36,7 +36,7 @@ import pandas as pd
 from scipy.stats import norm
 from sklearn.ensemble import HistGradientBoostingRegressor
 from sklearn.impute import SimpleImputer
-from sklearn.linear_model import Ridge
+from sklearn.linear_model import RidgeCV
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
@@ -106,17 +106,31 @@ def train_model(
     X_train, y_train = train[feature_columns], train["target"]
     X_test, y_test = test[feature_columns], test["target"]
 
-    # ── Baseline: Ridge ────────────────────────────────────────────
+    # ── Baseline: RidgeCV ─────────────────────────────────────────
+    # CV-tuned alpha avoids the ill-conditioned solve that fixed-α
+    # Ridge fell into on near-collinear feature columns (lag features
+    # + weather are highly correlated). Without this the linear
+    # solver was producing matmul overflows and bogus near-perfect
+    # OOS metrics — masking the actual error structure.
     ridge = Pipeline([
         ("imputer", SimpleImputer(strategy="median")),
         ("scaler", StandardScaler()),
-        ("model", Ridge(alpha=1.0, random_state=random_state)),
+        ("model", RidgeCV(alphas=(0.1, 1.0, 10.0, 100.0, 1000.0))),
     ])
     ridge.fit(X_train, y_train)
     ridge_pred = ridge.predict(X_test)
-    ridge_metrics = _score(y_test, ridge_pred)
-    log.info("ridge OOS — MAE %.0f  RMSE %.0f  R2 %.3f",
-             ridge_metrics["mae"], ridge_metrics["rmse"], ridge_metrics["r2"])
+    # Guard against numerical blowups: any non-finite prediction means
+    # the linear solve is unstable on this dataset; reject and let HGB
+    # win automatically. (RidgeCV usually fixes this but defense-in-
+    # depth is cheap.)
+    if not np.all(np.isfinite(ridge_pred)):
+        log.warning("ridge produced non-finite predictions — rejecting")
+        ridge_metrics = {"mae": float("inf"), "rmse": float("inf"), "r2": -1e9}
+    else:
+        ridge_metrics = _score(y_test, ridge_pred)
+    log.info("ridge OOS — MAE %.0f  RMSE %.0f  R2 %.3f  (alpha=%g)",
+             ridge_metrics["mae"], ridge_metrics["rmse"], ridge_metrics["r2"],
+             ridge.named_steps["model"].alpha_)
 
     # ── Stronger: HGB regressor ────────────────────────────────────
     hgb = Pipeline([
