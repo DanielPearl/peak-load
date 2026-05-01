@@ -111,18 +111,74 @@ def fetch_kalshi_markets(cfg: Config) -> List[KalshiMarket]:
             real = _fetch_kalshi_real(cfg, prefix)
             if real:
                 return real
-            log.info("Kalshi returned 0 markets for series %r — Kalshi "
-                     "may not yet list a peak-load series for this "
-                     "region. Forecast still runs; watchlist will be "
-                     "empty until real markets list.", prefix)
+            log.info("Kalshi returned 0 markets for series %r — exchange "
+                     "may not yet list a peak-load series for this region.",
+                     prefix)
         except Exception as exc:  # noqa: BLE001
             log.warning("Kalshi real fetch failed (%s)", exc)
-    # No synthetic-market fallback: the dashboard would otherwise
-    # show fake tickers (e.g. KXERCOTPL-SIM-66000) that don't exist
-    # on the actual exchange. Better to show an empty watchlist with
-    # the model's forecast + threshold probabilities than to surface
-    # tickers a user can paste into Kalshi and get no results.
+    # If KALSHI_DEMO_MODE=true, generate plausible markets so the
+    # simulation pipeline (open position, mark, close on resolution)
+    # can be exercised end-to-end against the dashboard. Tickers are
+    # tagged DEMO so they're distinguishable from real ones.
+    if cfg.kalshi_demo_mode:
+        log.info("KALSHI_DEMO_MODE=true → generating demo markets")
+        return _demo_markets(cfg)
     return []
+
+
+def _demo_markets(cfg: Config) -> List[KalshiMarket]:
+    """Synthetic peak-load markets for demo / pipeline-validation use.
+
+    Prices are anchored on a Gaussian centered on the region's typical
+    seasonal peak so high thresholds price low and vice versa, with
+    ±3pt noise added so the model can find disagreements. Volumes /
+    OIs are randomized but stay above the bot's liquidity floors.
+
+    Tickers carry a DEMO suffix so they can't be confused with real
+    Kalshi markets when reading the dashboard or output JSON.
+    """
+    import time as _time
+    rng = np.random.default_rng(seed=int(_time.time()))
+    avg_peak = (cfg.region_meta["summer_peak_mw"]
+                + cfg.region_meta["winter_peak_mw"]) / 2
+    market_sigma = avg_peak * 0.05
+    out: List[KalshiMarket] = []
+    from scipy.stats import norm
+    for thr in cfg.threshold_grid_mw:
+        p = float(1 - norm.cdf((thr - avg_peak) / market_sigma))
+        p_noise = max(0.01, min(0.99, p + rng.normal(0, 0.03)))
+        yes_cents = int(round(p_noise * 100))
+        out.append(KalshiMarket(
+            ticker=f"{cfg.region_meta['kalshi_series_prefix']}-DEMO-{thr}",
+            yes_sub_title=f"Above {thr} MW (DEMO)",
+            threshold_mw=thr,
+            yes_ask_cents=yes_cents,
+            no_ask_cents=100 - yes_cents,
+            volume=int(rng.integers(100, 5000)),
+            open_interest=int(rng.integers(80, 4000)),
+            raw={"demo": True},
+        ))
+    return out
+
+
+def fetch_market_status(cfg: Config, ticker: str) -> Optional[dict]:
+    """Fetch a single market's current state — used by the daily
+    runner to detect when an open position's market has resolved.
+
+    Returns the raw market dict (status, settle value, prices) or None
+    if the API call fails. Intentionally non-fatal: if Kalshi is
+    unreachable we just leave the position open and try again
+    tomorrow.
+    """
+    if not (cfg.kalshi_api_key_id and cfg.kalshi_private_key_path
+            and HAS_CRYPTO):
+        return None
+    try:
+        client = _SignedClient(cfg)
+        return client.get(f"/markets/{ticker}").get("market", {})
+    except Exception as exc:  # noqa: BLE001
+        log.warning("market-status fetch failed for %s: %s", ticker, exc)
+        return None
 
 
 def _fetch_kalshi_real(cfg: Config, series_prefix: str) -> List[KalshiMarket]:

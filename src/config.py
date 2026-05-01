@@ -109,11 +109,35 @@ class Config:
     min_open_interest: int = 50
     max_spread_cents: int = 8
 
+    # ── Sim risk caps ─────────────────────────────────────────────────
+    # When a signal clears all gates the bot opens a 1-contract
+    # paper-trade position. Caps below limit total exposure across the
+    # daily run. Conservative defaults so the sim can't accidentally
+    # take on huge cumulative positions while threshold gates are
+    # being tuned.
+    bet_size_cents: int = 100         # $1 cap per bet (1 contract @ ≤99c)
+    max_open_positions: int = 5       # at most 5 simultaneous open positions
+    max_total_exposure_cents: int = 500  # $5 ceiling on total cash at risk
+    max_bets_per_day: int = 10        # safety net against signal storms
+
     # ── Synthetic data fallback ───────────────────────────────────────
     # When no real APIs are configured, the loaders generate realistic
     # synthetic data so the pipeline runs end-to-end. Set to False to
     # require real data and fail loudly if any source is unreachable.
     use_synthetic_when_missing: bool = True
+
+    # Demo mode for Kalshi markets. Default: off — when Kalshi has no
+    # peak-load series listed for the region (the current state of the
+    # exchange), the watchlist stays honestly empty rather than
+    # surfacing fake tickers a user can't look up.
+    #
+    # Setting KALSHI_DEMO_MODE=true generates synthetic peak-load
+    # markets with realistic-looking date+threshold tickers so the
+    # full sim pipeline (open position, hold, mark-to-market, close on
+    # resolution) can be exercised end-to-end against the dashboard.
+    # Demo positions are clearly tagged with DEMO in the decision
+    # metadata so they can be filtered out later.
+    kalshi_demo_mode: bool = False
 
     # ── Output paths (filled in __post_init__) ────────────────────────
     model_path: Path = field(default_factory=lambda: MODELS_DIR / "peak_load.pkl")
@@ -163,7 +187,15 @@ def load_config() -> Config:
         min_volume=int(os.environ.get("MIN_VOLUME", "50")),
         min_open_interest=int(os.environ.get("MIN_OPEN_INTEREST", "50")),
         max_spread_cents=int(os.environ.get("MAX_SPREAD_CENTS", "8")),
+        bet_size_cents=int(os.environ.get("BET_SIZE_CENTS", "100")),
+        max_open_positions=int(os.environ.get("MAX_OPEN_POSITIONS", "5")),
+        max_total_exposure_cents=int(os.environ.get(
+            "MAX_TOTAL_EXPOSURE_CENTS", "500")),
+        max_bets_per_day=int(os.environ.get("MAX_BETS_PER_DAY", "10")),
         use_synthetic_when_missing=(
             os.environ.get("USE_SYNTHETIC_WHEN_MISSING", "true").lower()
+            in ("true", "1", "yes")),
+        kalshi_demo_mode=(
+            os.environ.get("KALSHI_DEMO_MODE", "false").lower()
             in ("true", "1", "yes")),
     )
