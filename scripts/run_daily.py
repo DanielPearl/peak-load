@@ -38,6 +38,7 @@ from src.kalshi import fetch_kalshi_markets, fetch_market_status
 from src.model import load_model, threshold_probabilities
 from src.signals import compute_signals, signals_to_records
 from src.simulator import PeakLoadSimulator
+from src.validators import ValidatorCfg, validate_market
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)-7s %(name)s | %(message)s")
@@ -87,11 +88,37 @@ def main() -> int:
     n_buy = sum(1 for s in signals if s.decision.startswith("BUY"))
     log.info("%d signals (%d BUY recommendations)", len(signals), n_buy)
 
-    # ── 5. Resolve any open positions whose markets have closed ──────
+    # ── 5a. Resolve any open positions whose markets have closed ────
     _resolve_open_positions(cfg, sim)
 
-    # ── 6. Open new positions for BUY signals that clear risk caps ──
-    n_opened = _open_positions_for_signals(sim, signals, forecast_mw)
+    # ── 5b. Hedge any open positions whose price has moved enough ───
+    n_hedged = _maybe_hedge_open_positions(cfg, sim, markets)
+    if n_hedged:
+        log.info("opened %d hedge position(s)", n_hedged)
+
+    # ── 6. Validate + open new positions for BUY signals ────────────
+    val_cfg = _validator_cfg(cfg)
+    validated_signals = []
+    for s in signals:
+        if s.decision in ("BUY_YES", "BUY_NO"):
+            # Find matching market for the validator (we already have
+            # the signal's metadata but validate_market wants the full
+            # KalshiMarket object).
+            mkt = next((m for m in markets if m.ticker == s.ticker), None)
+            if mkt is None:
+                continue
+            # 24h * 60 = 1440 min; daily-cadence approx until we wire a
+            # real per-market mtc on the synthetic path.
+            ok, reason = validate_market(
+                mkt, val_cfg, forecast_mw=forecast_mw,
+                minutes_to_close=24 * 60.0)
+            if not ok:
+                log.info("validator skip %s: %s", s.ticker, reason)
+                continue
+            validated_signals.append(s)
+        else:
+            validated_signals.append(s)
+    n_opened = _open_positions_for_signals(sim, validated_signals, forecast_mw)
     log.info("opened %d new position(s); %d position(s) currently open",
              n_opened, len(sim.open_positions()))
 
@@ -180,6 +207,53 @@ def _open_positions_for_signals(
         if pid is not None:
             opened += 1
     return opened
+
+
+def _validator_cfg(cfg: Config) -> ValidatorCfg:
+    """Translate the flat Config dataclass into a ValidatorCfg."""
+    return ValidatorCfg(
+        min_volume=cfg.min_volume,
+        min_open_interest=cfg.min_open_interest,
+        max_spread_cents=cfg.val_max_spread_cents,
+        prob_bounds_cents=(cfg.val_prob_bounds_cents_low,
+                            cfg.val_prob_bounds_cents_high),
+        min_minutes_to_close=cfg.val_min_minutes_to_close,
+        max_minutes_to_close=cfg.val_max_minutes_to_close,
+        basis_risk_strike_window_mw=cfg.val_basis_risk_strike_window_mw,
+        basis_risk_max_hours_to_close=cfg.val_basis_risk_max_hours_to_close,
+    )
+
+
+def _maybe_hedge_open_positions(
+    cfg: Config, sim: PeakLoadSimulator, markets: list,
+) -> int:
+    """Run the hedge check across all open un-hedged positions. Returns
+    the count of hedges fired this tick.
+
+    For each open position: find its current market (if still listed),
+    pull the live yes/no asks, and ask the simulator if the hedge
+    triggers fire. Hedges are EV-locking offsets — opening the OTHER
+    side of the contract to compensate if our position reverses.
+    """
+    if not cfg.hedge_enabled:
+        return 0
+    by_ticker = {m.ticker: m for m in markets}
+    n = 0
+    for pos in sim.open_positions():
+        if pos["hedge_id"] is not None:
+            continue
+        # Ignore hedge positions themselves (their decision_json marks
+        # them with kind=hedge).
+        decision = pos["decision_json"] or ""
+        if "hedge" in decision:
+            continue
+        m = by_ticker.get(pos["ticker"])
+        if m is None:
+            continue
+        hedge_pid = sim.maybe_hedge(pos, m.yes_ask_cents, m.no_ask_cents)
+        if hedge_pid is not None:
+            n += 1
+    return n
 
 
 def _resolve_open_positions(cfg: Config, sim: PeakLoadSimulator) -> None:

@@ -110,15 +110,31 @@ class Config:
     max_spread_cents: int = 8
 
     # ── Sim risk caps ─────────────────────────────────────────────────
-    # When a signal clears all gates the bot opens a 1-contract
-    # paper-trade position. Caps below limit total exposure across the
-    # daily run. Conservative defaults so the sim can't accidentally
-    # take on huge cumulative positions while threshold gates are
-    # being tuned.
-    bet_size_cents: int = 100         # $1 cap per bet (1 contract @ ≤99c)
-    max_open_positions: int = 5       # at most 5 simultaneous open positions
-    max_total_exposure_cents: int = 500  # $5 ceiling on total cash at risk
-    max_bets_per_day: int = 10        # safety net against signal storms
+    # Mirror gas-prices / unemployment-claims defaults: 1 contract per
+    # bet, 1 position open at a time, $1 cap. Daily cadence + hold-to-
+    # resolution means a single position is the natural unit of risk.
+    bet_size_cents: int = 100         # $1 cap per bet
+    max_open_positions: int = 1       # one bet at a time, like the other bots
+    max_total_exposure_cents: int = 200  # $2 ceiling
+    max_bets_per_day: int = 5         # cap on signal-storm days
+
+    # ── Hedge thresholds ──────────────────────────────────────────────
+    # If a position's current price has moved enough from entry, open
+    # an offsetting contract on the OTHER side to lock in P&L. Same
+    # pattern as gas-prices/unemployment-claims hedge logic.
+    hedge_enabled: bool = True
+    hedge_profit_lock_cents: int = 20  # +20c in our favor → hedge
+    hedge_stop_loss_cents: int = 15    # -15c against → hedge
+    hedge_size_fraction: float = 1.0   # full hedge size
+
+    # ── Validator thresholds (pre-trade gates beyond signals.py) ─────
+    val_max_spread_cents: int = 8
+    val_prob_bounds_cents_low: int = 5
+    val_prob_bounds_cents_high: int = 95
+    val_min_minutes_to_close: int = 30
+    val_max_minutes_to_close: int = 60 * 24 * 7
+    val_basis_risk_strike_window_mw: float = 1500
+    val_basis_risk_max_hours_to_close: float = 4
 
     # ── Synthetic data fallback ───────────────────────────────────────
     # When no real APIs are configured, the loaders generate realistic
@@ -188,10 +204,19 @@ def load_config() -> Config:
         min_open_interest=int(os.environ.get("MIN_OPEN_INTEREST", "50")),
         max_spread_cents=int(os.environ.get("MAX_SPREAD_CENTS", "8")),
         bet_size_cents=int(os.environ.get("BET_SIZE_CENTS", "100")),
-        max_open_positions=int(os.environ.get("MAX_OPEN_POSITIONS", "5")),
+        max_open_positions=int(os.environ.get("MAX_OPEN_POSITIONS", "1")),
         max_total_exposure_cents=int(os.environ.get(
-            "MAX_TOTAL_EXPOSURE_CENTS", "500")),
-        max_bets_per_day=int(os.environ.get("MAX_BETS_PER_DAY", "10")),
+            "MAX_TOTAL_EXPOSURE_CENTS", "200")),
+        max_bets_per_day=int(os.environ.get("MAX_BETS_PER_DAY", "5")),
+        hedge_enabled=(
+            os.environ.get("HEDGE_ENABLED", "true").lower()
+            in ("true", "1", "yes")),
+        hedge_profit_lock_cents=int(os.environ.get(
+            "HEDGE_PROFIT_LOCK_CENTS", "20")),
+        hedge_stop_loss_cents=int(os.environ.get(
+            "HEDGE_STOP_LOSS_CENTS", "15")),
+        hedge_size_fraction=float(os.environ.get(
+            "HEDGE_SIZE_FRACTION", "1.0")),
         use_synthetic_when_missing=(
             os.environ.get("USE_SYNTHETIC_WHEN_MISSING", "true").lower()
             in ("true", "1", "yes")),
