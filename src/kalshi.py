@@ -97,13 +97,17 @@ class _SignedClient:
 # Public API
 # --------------------------------------------------------------------------- #
 
-def fetch_kalshi_markets(cfg: Config) -> List[KalshiMarket]:
+def fetch_kalshi_markets(
+    cfg: Config,
+    forecast_mw: Optional[float] = None,
+) -> List[KalshiMarket]:
     """Return the open peak-load markets for the configured region.
 
     Real path: Kalshi GET /markets?series_ticker={prefix}&status=open.
-    Falls back to synthetic markets when credentials aren't set so a
-    fresh clone runs end-to-end. Synthetic markets are anchored to
-    the threshold grid in config.
+    When KALSHI_DEMO_MODE=true, generates synthetic markets anchored
+    on ``forecast_mw`` (or the region's summer/winter average if no
+    forecast was passed) so the dashboard can show realistic-looking
+    probabilities for pipeline testing.
     """
     prefix = cfg.region_meta["kalshi_series_prefix"]
     if cfg.kalshi_api_key_id and cfg.kalshi_private_key_path and HAS_CRYPTO:
@@ -116,37 +120,48 @@ def fetch_kalshi_markets(cfg: Config) -> List[KalshiMarket]:
                      prefix)
         except Exception as exc:  # noqa: BLE001
             log.warning("Kalshi real fetch failed (%s)", exc)
-    # If KALSHI_DEMO_MODE=true, generate plausible markets so the
-    # simulation pipeline (open position, mark, close on resolution)
-    # can be exercised end-to-end against the dashboard. Tickers are
-    # tagged DEMO so they're distinguishable from real ones.
     if cfg.kalshi_demo_mode:
         log.info("KALSHI_DEMO_MODE=true → generating demo markets")
-        return _demo_markets(cfg)
+        return _demo_markets(cfg, forecast_mw=forecast_mw)
     return []
 
 
-def _demo_markets(cfg: Config) -> List[KalshiMarket]:
-    """Synthetic peak-load markets for demo / pipeline-validation use.
+def _demo_markets(
+    cfg: Config,
+    forecast_mw: Optional[float] = None,
+) -> List[KalshiMarket]:
+    """Synthetic peak-load markets for demo / pipeline-validation.
 
-    Prices are anchored on a Gaussian centered on the region's typical
-    seasonal peak so high thresholds price low and vice versa, with
-    ±3pt noise added so the model can find disagreements. Volumes /
-    OIs are randomized but stay above the bot's liquidity floors.
+    When ``forecast_mw`` is passed, demo prices anchor on it so the
+    Kalshi YES distribution mirrors what real Kalshi markets would
+    look like (strikes near forecast price ≈ 50%, far below price
+    ≈ 99%, far above price ≈ 1%). With a small ±3pt random tilt so
+    the model can find disagreements vs the demo "market".
 
-    Tickers carry a DEMO suffix so they can't be confused with real
-    Kalshi markets when reading the dashboard or output JSON.
+    Without a forecast (e.g. test scripts that don't run the model),
+    falls back to the region's summer/winter avg peak — useful for
+    sanity-checking the price curve without a model loaded.
     """
     import time as _time
     rng = np.random.default_rng(seed=int(_time.time()))
-    avg_peak = (cfg.region_meta["summer_peak_mw"]
-                + cfg.region_meta["winter_peak_mw"]) / 2
-    market_sigma = avg_peak * 0.05
+    if forecast_mw is not None:
+        anchor = float(forecast_mw)
+        # σ proportional to anchor — about 5% gives a plausible spread
+        # of strikes from 99c to 1c across ±2-3σ.
+        market_sigma = max(anchor * 0.05, 1500.0)
+    else:
+        anchor = (cfg.region_meta["summer_peak_mw"]
+                  + cfg.region_meta["winter_peak_mw"]) / 2
+        market_sigma = anchor * 0.05
     out: List[KalshiMarket] = []
     from scipy.stats import norm
     for thr in cfg.threshold_grid_mw:
-        p = float(1 - norm.cdf((thr - avg_peak) / market_sigma))
-        p_noise = max(0.01, min(0.99, p + rng.normal(0, 0.03)))
+        p = float(1 - norm.cdf((thr - anchor) / market_sigma))
+        # ±8pt demo noise: real Kalshi markets aren't perfectly priced
+        # either, and a too-tight demo (±3pt) produced no edges at all.
+        # σ=0.08 → ~6% of strikes will land >10pt off, so the dashboard
+        # shows occasional BUY signals firing through the pipeline.
+        p_noise = max(0.01, min(0.99, p + rng.normal(0, 0.08)))
         yes_cents = int(round(p_noise * 100))
         out.append(KalshiMarket(
             ticker=f"{cfg.region_meta['kalshi_series_prefix']}-DEMO-{thr}",

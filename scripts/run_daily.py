@@ -90,7 +90,9 @@ def main() -> int:
              cfg.threshold_grid_mw[-1], probs[cfg.threshold_grid_mw[-1]])
 
     # ── 3. Kalshi markets ─────────────────────────────────────────────
-    markets = fetch_kalshi_markets(cfg)
+    # Pass forecast so demo-mode markets anchor on it (not the static
+    # summer-peak reference). Real-Kalshi path ignores forecast_mw.
+    markets = fetch_kalshi_markets(cfg, forecast_mw=forecast_mw)
     log.info("fetched %d open Kalshi markets", len(markets))
 
     # ── 4. Compute signals ────────────────────────────────────────────
