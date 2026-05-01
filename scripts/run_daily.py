@@ -73,7 +73,17 @@ def main() -> int:
     forecast_mw = float(model.predict(feature_row)[0])
     log.info("today's forecast: %.0f MW", forecast_mw)
 
-    # ── 2. Threshold probabilities ────────────────────────────────────
+    # ── 2. Threshold grid centered on TODAY'S forecast ───────────────
+    # The static grid in cfg was anchored on the region's SUMMER peak,
+    # which made every probability collapse to 0% / 100% on shoulder-
+    # season days when actual forecast lands well below summer peak.
+    # Real Kalshi markets list strikes near the expected peak, so we
+    # mirror that: span forecast ± span_sigma × residual_std.
+    cfg.threshold_grid_mw = _dynamic_threshold_grid(
+        forecast_mw, model.residual_std)
+    log.info("threshold grid (dynamic): %d MW .. %d MW around forecast",
+             cfg.threshold_grid_mw[0], cfg.threshold_grid_mw[-1])
+
     probs = threshold_probabilities(model, feature_row, cfg.threshold_grid_mw)
     log.info("threshold prob span: %d MW p=%.2f .. %d MW p=%.2f",
              cfg.threshold_grid_mw[0], probs[cfg.threshold_grid_mw[0]],
@@ -207,6 +217,34 @@ def _open_positions_for_signals(
         if pid is not None:
             opened += 1
     return opened
+
+
+def _dynamic_threshold_grid(
+    forecast_mw: float,
+    residual_std: float,
+    span_sigma: float = 2.5,
+    step_mw: int = 1500,
+    n_strikes: int = 11,
+) -> list[int]:
+    """Build a threshold grid centered on today's forecast.
+
+    Spans forecast ± span_sigma·residual_std, snapped to step_mw
+    boundaries and symmetric around the forecast. With defaults
+    (2.5σ, 11 strikes, 1500 MW step) we get strikes spanning roughly
+    ±2σ where probabilities transition smoothly from ~0.1% to ~99%.
+
+    Static-grid alternative (cfg.threshold_grid_mw, anchored on the
+    region's summer peak) was useful for sanity-checking model output
+    against a fixed reference but produced all-0% or all-100% rows
+    on shoulder-season days when forecast and summer peak diverge.
+    """
+    center = int(round(forecast_mw / step_mw)) * step_mw
+    # Width controlled by both σ and step — pick whichever is wider so
+    # we always span at least n_strikes steps even when σ is small.
+    width_from_sigma = int(round(span_sigma * residual_std / step_mw))
+    half = max((n_strikes - 1) // 2, width_from_sigma)
+    return [center + (i - half) * step_mw
+            for i in range(2 * half + 1)]
 
 
 def _validator_cfg(cfg: Config) -> ValidatorCfg:
