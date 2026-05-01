@@ -58,6 +58,21 @@ CREATE TABLE IF NOT EXISTS trades (
     kind TEXT NOT NULL                   -- "entry" | "exit"
 );
 
+-- position_marks is empty for this bot (we don't refresh marks
+-- intra-day on a daily-cadence bot) but the unified dashboard
+-- LEFT JOINs against it from active-bet queries, so the table
+-- needs to exist or the join errors out.
+CREATE TABLE IF NOT EXISTS position_marks (
+    position_id INTEGER PRIMARY KEY,
+    ticker TEXT NOT NULL,
+    yes_ask_cents INTEGER,
+    no_ask_cents INTEGER,
+    yes_bid_cents INTEGER,
+    mid_cents REAL,
+    spread_cents INTEGER,
+    updated_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS model_snapshots (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     captured_at TEXT NOT NULL,
