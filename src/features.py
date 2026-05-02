@@ -224,21 +224,49 @@ def _add_calendar_features(out: pd.DataFrame) -> None:
 
 
 def _add_target_lag_features(out: pd.DataFrame) -> None:
-    """Lagged price + rolling stats + log-returns.
+    """Lagged price + rolling stats + log-returns + trend + vol regime.
 
     NG is volatility-clustered: a big move yesterday raises the
     probability of a big move today (regardless of direction). Log-
     return lags let the GBMs learn that dynamic. Plain price lags
-    handle the level / mean-reversion forces.
+    handle the level / mean-reversion forces. Trend features capture
+    the bigger-picture regime (above-trend vs below-trend, short-term
+    vs long-term momentum). Realized-vol features tell the model
+    whether we're in a high-vol or low-vol regime, which determines
+    how seriously to take any given lag signal.
     """
     p = out["target"]
-    for lag in (1, 2, 3, 7, 14):
+    p_lag1 = p.shift(1)  # always shift before any rolling op (leakage guard)
+
+    # ── Plain price lags. Short to long. ─────────────────────────────
+    for lag in (1, 2, 3, 5, 7, 14, 30, 60, 90):
         out[f"target_lag_{lag}"] = p.shift(lag)
-    out["target_rolling_7"] = p.shift(1).rolling(7, min_periods=3).mean()
-    out["target_rolling_30"] = p.shift(1).rolling(30, min_periods=10).mean()
-    out["target_rolling_30_std"] = (p.shift(1)
-                                     .rolling(30, min_periods=10).std())
-    # Log-returns: ln(p_t / p_{t-1}). Stable across price regimes.
+
+    # ── Rolling means (level reference). ────────────────────────────
+    sma_7 = p_lag1.rolling(7, min_periods=3).mean()
+    sma_30 = p_lag1.rolling(30, min_periods=10).mean()
+    sma_90 = p_lag1.rolling(90, min_periods=30).mean()
+    out["target_rolling_7"] = sma_7
+    out["target_rolling_30"] = sma_30
+    out["target_rolling_90"] = sma_90
+    out["target_rolling_30_std"] = p_lag1.rolling(30, min_periods=10).std()
+    out["target_rolling_90_std"] = p_lag1.rolling(90, min_periods=30).std()
+
+    # ── Trend features: where the price sits relative to its trend.
+    # The point isn't the level itself (lags already encode that) — it's
+    # the *deviation* from the trend, which is what mean-reversion or
+    # breakout strategies key on. SMA-crossover features encode the
+    # short-vs-long-momentum regime.
+    out["trend_dev_30"] = p_lag1 - sma_30        # above/below 30d trend
+    out["trend_dev_90"] = p_lag1 - sma_90        # above/below 90d trend
+    out["trend_sma7_minus_sma30"] = sma_7 - sma_30   # short vs medium MA
+    out["trend_sma30_minus_sma90"] = sma_30 - sma_90  # medium vs long MA
+    # Rate of change over various windows.
+    out["roc_7"] = (p_lag1 / p.shift(8) - 1.0)   # 7d return shifted
+    out["roc_30"] = (p_lag1 / p.shift(31) - 1.0)
+    out["roc_90"] = (p_lag1 / p.shift(91) - 1.0)
+
+    # ── Log-returns: ln(p_t / p_{t-1}). Stable across price regimes.
     log_p = np.log(p.replace(0, np.nan))
     log_ret_1 = (log_p - log_p.shift(1)).shift(1)
     out["log_return_lag_1"] = log_ret_1
@@ -246,3 +274,17 @@ def _add_target_lag_features(out: pd.DataFrame) -> None:
     out["log_return_lag_7"] = log_ret_1.shift(6)
     out["log_return_abs_rolling_7"] = (log_ret_1.abs()
                                         .rolling(7, min_periods=3).mean())
+    # Realized-vol features: rolling std of log returns. NG vol is
+    # bursty — high-vol periods last days. Knowing we're in one tells
+    # the per-strike classifiers to widen their forecast distribution.
+    out["log_return_std_14"] = log_ret_1.rolling(14, min_periods=5).std()
+    out["log_return_std_30"] = log_ret_1.rolling(30, min_periods=10).std()
+    out["log_return_std_90"] = log_ret_1.rolling(90, min_periods=30).std()
+    # Vol-of-vol: is volatility itself trending? (Useful for regime
+    # detection — vol-of-vol up = approaching a dislocation.)
+    out["log_return_vol_30_minus_90"] = (
+        out["log_return_std_30"] - out["log_return_std_90"]
+    )
+
+    # ── Momentum acceleration: is the trend speeding up or fading?
+    out["log_return_accel"] = log_ret_1 - log_ret_1.shift(7)
