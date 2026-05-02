@@ -167,6 +167,14 @@ def main() -> int:
         r2=model.metrics.get("r2", 0.0),
         mae=model.metrics.get("mae", 0.0),
         rmse=model.metrics.get("rmse", 0.0),
+        # Per-strike binary-classification headline metrics — what the
+        # bot actually scores for each "above strike Y/N" decision.
+        # The dashboard's Model section reads these.
+        classifier_accuracy=model.metrics.get("per_strike_avg_accuracy", 0.0),
+        precision=model.metrics.get("per_strike_avg_precision", 0.0),
+        recall=model.metrics.get("per_strike_avg_recall", 0.0),
+        f1=model.metrics.get("per_strike_avg_f1", 0.0),
+        roc_auc=model.metrics.get("per_strike_avg_roc_auc", 0.0),
     )
     for s in signals:
         sim.record_market_view(

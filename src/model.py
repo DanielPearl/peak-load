@@ -51,7 +51,9 @@ from sklearn.metrics import (
     f1_score,
     mean_absolute_error,
     mean_squared_error,
+    precision_score,
     r2_score,
+    recall_score,
     roc_auc_score,
 )
 from sklearn.model_selection import TimeSeriesSplit
@@ -539,6 +541,10 @@ def train_model(
                 "n_train_pos": int(y_thr_train.sum()),
                 "n_test_pos": int(y_thr_test.sum()),
                 "test_accuracy": float(accuracy_score(y_thr_test, test_pred)),
+                "test_precision": float(
+                    precision_score(y_thr_test, test_pred, zero_division=0)),
+                "test_recall": float(
+                    recall_score(y_thr_test, test_pred, zero_division=0)),
                 "test_f1": float(f1_score(y_thr_test, test_pred, zero_division=0)),
                 "test_roc_auc": float(roc_auc_score(y_thr_test, test_probs)),
             }
@@ -568,10 +574,12 @@ def train_model(
     # binary trading decision against Kalshi.
     if threshold_metrics:
         avg_acc = float(np.mean([m["test_accuracy"] for m in threshold_metrics.values()]))
+        avg_prec = float(np.mean([m["test_precision"] for m in threshold_metrics.values()]))
+        avg_rec = float(np.mean([m["test_recall"] for m in threshold_metrics.values()]))
         avg_f1 = float(np.mean([m["test_f1"] for m in threshold_metrics.values()]))
         avg_auc = float(np.mean([m["test_roc_auc"] for m in threshold_metrics.values()]))
     else:
-        avg_acc = avg_f1 = avg_auc = 0.0
+        avg_acc = avg_prec = avg_rec = avg_f1 = avg_auc = 0.0
 
     metrics = {
         # Point-forecast diagnostics (the dashboard reads these).
@@ -582,15 +590,18 @@ def train_model(
         # Per-strike classifier headline numbers (the trading-decision
         # accuracy that actually matters).
         "per_strike_avg_accuracy": avg_acc,
+        "per_strike_avg_precision": avg_prec,
+        "per_strike_avg_recall": avg_rec,
         "per_strike_avg_f1": avg_f1,
         "per_strike_avg_roc_auc": avg_auc,
         "per_strike_count": len(threshold_classifiers),
         "n_features_selected": len(feature_columns),
     }
-    log.info("test-set headline — MAE=$%.3f/MMBTU  R2=%.3f  | "
-             "per-strike avg: acc=%.3f F1=%.3f AUC=%.3f over %d thresholds",
+    log.info("test-set headline — MAE=$%.3f/MMBTU  R2=%.3f  | per-strike avg: "
+             "acc=%.3f prec=%.3f rec=%.3f F1=%.3f AUC=%.3f over %d thresholds",
              pf_metrics["mae"], pf_metrics["r2"],
-             avg_acc, avg_f1, avg_auc, len(threshold_classifiers))
+             avg_acc, avg_prec, avg_rec, avg_f1, avg_auc,
+             len(threshold_classifiers))
 
     return NatGasModel(
         feature_columns=list(feature_columns),

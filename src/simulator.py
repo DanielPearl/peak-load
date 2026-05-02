@@ -358,9 +358,15 @@ class NatGasSimulator:
         self, *, forecast_value: float, residual_std: float,
         median_threshold_prob: float, n_features: int,
         r2: float, mae: float, rmse: float,
+        classifier_accuracy: float = 0.0,
+        precision: float = 0.0, recall: float = 0.0,
+        f1: float = 0.0, roc_auc: float = 0.0,
     ) -> None:
-        """One row per daily run, populated for the dashboard's
-        Model section."""
+        """One row per daily run, populated for the dashboard's Model
+        section. The classification metrics (acc/prec/recall/F1/AUC)
+        are the per-strike binary classifiers' OOS averages — what the
+        bot actually scores for each "above strike Y/N" decision.
+        """
         now = datetime.now(timezone.utc).isoformat()
         with closing(self._conn()) as c, c:
             c.execute(
@@ -376,8 +382,8 @@ class NatGasSimulator:
                  forecast_value,
                  forecast_value + 1.645 * residual_std,
                  residual_std, n_features,
-                 r2, r2, r2, r2, r2),   # placeholders — Model section
-            )                            # cards just need non-zero values
+                 classifier_accuracy, precision, recall, f1, roc_auc),
+            )
 
     def record_market_view(
         self, *, ticker: str, title: str, threshold_value: Optional[float],
