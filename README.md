@@ -1,32 +1,35 @@
-# peak-load — Energy / Weather Kalshi Forecasting Bot
+# Natural Gas — Henry Hub Daily Price Bot
 
-Daily-cadence forecasting model for **electricity peak load**, designed
-to compare model probabilities against Kalshi peak-load market prices
-and surface mispricings.
+Daily-cadence forecasting model for **Henry Hub natural gas spot price**
+(`KXNATGASD` on Kalshi, Pyth-settled at 5pm EDT each day, $/MMBTU
+thresholds at $0.005 ticks). Compares model probabilities against
+Kalshi market prices and surfaces mispricings.
 
-The model predicts `daily_peak_load_mw` (or, when renewables data is
-available, `net_peak_load_mw = load − solar − wind`) for a configurable
-ISO region — ERCOT, NYISO, PJM, or CAISO — converts the point forecast
-into per-threshold probabilities via empirical residual std, then
-compares against Kalshi market prices.
+NG is the most weather-driven commodity in the US energy complex:
+winter heating-degree-days drive residential demand, summer
+cooling-degree-days drive power-burn demand from gas-fired plants
+dispatching against AC load. The model captures that mechanism plus
+the slower fundamentals (storage, production, LNG exports) that move
+prices over weeks.
 
 ## Quick start
 
 ```bash
-git clone git@github.com:DanielPearl/peak-load.git
-cd peak-load
+git clone git@github.com:DanielPearl/natural-gas.git
+cd natural-gas
 
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
-cp .env.example .env        # populate optional API keys
+cp .env.example .env        # populate Kalshi + EIA credentials
 
 python scripts/train.py      # train the model (uses synthetic data
-                             # if EIA / NOAA / OpenWeather keys are
-                             # not configured — fully runnable
-                             # without any real credentials)
+                             # if EIA / NOAA keys aren't configured —
+                             # the pipeline runs end-to-end without
+                             # real credentials but real data is
+                             # required for trading signals)
 
-python scripts/run_daily.py  # build today's signals
+python scripts/run_daily.py  # build today's signals against real Kalshi
 ```
 
 Outputs land in:
@@ -41,112 +44,91 @@ data/sim.db                  SQLite mirror for the unified dashboard
 
 ```
 src/
-  config.py         all knobs, .env loader, region presets
-  data_loaders.py   EIA load + NOAA weather + OpenWeather forecast
-                    (real-API stubs + synthetic fallback)
-  features.py       CDD/HDD, heat index, lags, rolling stats, calendar
-  model.py          Ridge baseline + HGB stronger model, residual-std
-                    probability conversion
-  kalshi.py         signed REST client + synthetic market generator
-  signals.py        edge computation, liquidity filters, BUY/NO_TRADE
+  config.py         all knobs, .env loader, cross-Kalshi feature
+                    series, weather-station weighting
+  data_loaders.py   EIA Henry Hub spot + storage + production +
+                    weather (national HDD/CDD aggregate) + cross-
+                    Kalshi event features (war, hurricane, oil)
+  features.py       weather lags + storage delta + production yoy +
+                    target lags / log-returns + calendar (Thursday
+                    storage-report indicator), all leakage-safe
+  model.py          quantile-GBM ensemble + ElasticNet meta-voice +
+                    per-strike calibrated classifier ensemble +
+                    walk-forward feature selection + correlation prune
+  kalshi.py         signed REST client. Real Kalshi only — no demo mode
+  signals.py        edge computation (model_p − kalshi_implied), gates
+                    on liquidity / spread / edge thresholds
+  simulator.py      paper-trading simulator with hedge logic
+  validators.py     pre-trade gates: liquidity, spread, time-to-close,
+                    basis-risk zone
+
 scripts/
-  train.py          one-shot training entry point
-  run_daily.py      daily signals pipeline (cron-ready)
+  train.py          full training pipeline → models/natgas_price.pkl
+  run_daily.py      daily inference + position lifecycle
+  smoke_test.py     CI sanity check
 ```
 
-### Data flow
+## Data sources
 
-```
-EIA load            ┐
-NOAA weather       ─┼─►  build_panel ──►  build_features ──►  train_model
-EIA renewables      ┘                                                │
-                                                                     ▼
-OpenWeather forecast ─►  build_today_row ──►  threshold_probabilities
-                                                                     │
-                                                                     ▼
-Kalshi markets ─────────────────────────────────────────►  compute_signals
-                                                                     │
-                                                                     ▼
-                                              outputs/daily_signals.{csv,json}
-                                              data/sim.db (dashboard)
-```
+| Source | What | Real path |
+|---|---|---|
+| EIA | Henry Hub daily spot | `NG.RNGWHHD.D` series |
+| EIA | Weekly storage | `NG.NW2_EPG0_SWO_R48_BCF.W` |
+| EIA | Monthly production | `NG.N9070US2.M` (forward-filled to daily) |
+| NOAA | Daily weather observations | GHCND (stub — wire when needed) |
+| OpenWeather | Next-day forecast | One Call 3.0 (real) |
+| Kalshi | Cross-market features | 14 series: crude oil, war/conflict, hurricane, Fed, retail gas |
 
-### Synthetic data fallback
+## Cross-Kalshi event features
 
-If `EIA_API_KEY` / `NOAA_TOKEN` / `OPENWEATHER_API_KEY` /
-`KALSHI_API_KEY_ID` aren't set, each loader falls back to a synthetic
-generator that produces realistic-looking data. This lets a clone run
-end-to-end before any keys are configured. For real trading you want
-all four populated; for development this fallback is convenient.
+The model exposes a `xk_*` family of features pulled from related
+Kalshi markets at inference time:
 
-## Region presets
+- **Crude oil**: `KXBRENTD`, `KXWTI`, `KXBRENTW` — global oil markets,
+  partial substitute for NG in industrial heat
+- **War / geopolitics**: `KXRUSSIAUKR`, `KXIRANISRAEL`, `KXISRAELHAMAS`,
+  `KXVENZ` — risk premium drivers (Russia is the world's #1 NG
+  exporter, so any escalation moves global LNG and indirectly Henry Hub)
+- **Hurricane**: `KXHURPATHFLA`, `KXHURCATFL`, `KXHURCTOTMAJ` — Gulf
+  of Mexico hurricane impact on production + LNG terminal disruption
+- **Macro / Fed**: `KXFEDDECISION`, `KXRECESSION` — discount-rate
+  effect + demand outlook
+- **Retail gas**: `KXAAAGASD`, `KXAAAGASW` — refining-margin signal
+  (oil products move with NG via crack spreads)
 
-`ENERGY_REGION=ercot` (default) | `nyiso` | `pjm` | `caiso`. Each
-preset wires up the right EIA respondent code, NOAA station, lat/lon
-for OpenWeather, reference summer/winter peak (used to anchor the
-threshold grid), and Kalshi series prefix.
+For each series we expose `_avg_prob`, `_max_prob`, `_n_open`,
+`_vol_sum` channels. Walk-forward selection prunes whichever don't
+add signal. At training time these features are NaN historically (no
+backfill of Kalshi prices yet); at inference they get today's snapshot.
 
-## Threshold probabilities
+## Risk caps
 
-The model outputs a point forecast. We convert that to a per-threshold
-probability using empirical OOS residual std:
+Defaults — override via `.env`:
 
-```
-P(load > thr) = 1 − Φ((thr − forecast) / residual_std)
-```
+| Setting | Default |
+|---|---|
+| Bet size | $1 (100 cents) |
+| Max open positions | 1 |
+| Max total exposure | $2 |
+| Max bets per day | 5 |
+| Min edge to fire | 5 percentage points |
+| Hedge profit lock | +20¢ in our favor |
+| Hedge stop-loss | −15¢ against |
 
-The threshold grid auto-populates (every 1.5 K MW around the region's
-typical peak ± 15%) but can be overridden via `THRESHOLD_GRID_MW`.
+## Cron deployment
 
-## Signal logic
-
-For each Kalshi market:
-
-```
-edge = model_prob − (yes_ask / 100)
-if edge >=  MIN_EDGE  → BUY_YES
-if edge <= -MIN_EDGE  → BUY_NO
-otherwise            → NO_TRADE
-```
-
-Plus liquidity filters: `MIN_VOLUME`, `MIN_OPEN_INTEREST`,
-`MAX_SPREAD_CENTS`.
-
-## Deploying on a DigitalOcean droplet
-
-```bash
-ssh root@your-droplet
-cd /root
-git clone git@github.com:DanielPearl/peak-load.git
-cd peak-load
-
-python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env       # populate API keys
-
-# One-time training
-python scripts/train.py
-
-# Daily cron — run before Kalshi peak-load markets close.
-# ERCOT/CAISO: ~6pm local, NYISO/PJM: ~5pm local. UTC offsets vary.
-# Example: ERCOT (UTC-5) → run at 21:00 UTC = 16:00 CDT.
-crontab -e
-# Add:
-#   0 21 * * * cd /root/peak-load && /root/peak-load/.venv/bin/python scripts/run_daily.py >> /var/log/peak-load.log 2>&1
+```cron
+# Daily at 4pm EDT — one hour before KXNATGASD 5pm settlement.
+0 20 * * * cd /root/natural-gas && /root/natural-gas/.venv/bin/python scripts/run_daily.py >> /var/log/natural-gas.log 2>&1
 ```
 
-The bot writes both human-readable outputs (`outputs/`) and a SQLite
-`data/sim.db` that the unified Kalshi dashboard reads alongside the
-gas-prices and unemployment-claims bots.
+The signed-REST client uses the same RSA private key as the other
+Kalshi bots in this monorepo (gas-prices, unemployment-claims,
+whale-watcher) — they share `Secret Keys/kalshi_api_key.txt`.
 
-## What's next
+## Sister bot
 
-- Wire real NOAA + OpenWeather paths (currently `NotImplementedError` stubs)
-- Real EIA renewables fetch (same TODO)
-- Track signal performance over time → calibration curve, P&L histogram
-- Explore quantile-regression instead of point-forecast + Gaussian std
-- Add holidays for years past 2027 (HOLIDAY_SET in features.py)
-
-## License
-
-MIT — see LICENSE.
+The **retail gas price bot** (`/Kalshi/Gas Prices/`) targets
+`KXAAAGASW` — AAA weekly retail gasoline. Different commodity,
+different mechanism (downstream of crude, refining margins, hurricane
+refinery disruption). The two bots are complementary, not duplicative.

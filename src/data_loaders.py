@@ -1,19 +1,19 @@
-"""Data loaders for electricity load, weather, and renewable generation.
+"""Data loaders for the Natural Gas Price prediction bot.
 
-Three real sources are wired in:
+Real sources wired in:
 
-    EIA           electricity load by ISO/respondent
-                  https://www.eia.gov/opendata/   (free, instant signup)
-    NOAA          weather observations + station metadata
-                  https://www.ncdc.noaa.gov/cdo-web/token  (free)
-    OpenWeather   forecast (next 5 days hourly)
-                  https://openweathermap.org/api  (free tier sufficient)
+  EIA           Henry Hub daily spot price + weekly storage +
+                production + consumption + LNG exports
+                https://www.eia.gov/opendata/   (free)
+  NOAA          Daily weather observations for consumption-weighted
+                US weather index (HDD / CDD national).
+                https://www.ncdc.noaa.gov/cdo-web/token  (free)
+  OpenWeather   Forecast for next-day weather (One Call 3.0)
+  Kalshi        Cross-market implied probabilities for crude oil,
+                war/conflict, hurricane, fed/policy events
 
 If a key isn't set, each loader falls back to a synthetic generator
-that produces realistic-looking data so the rest of the pipeline can
-still run end-to-end. This is explicitly to make a fresh clone usable
-without configuring four API keys; for any actual trading you'd want
-real data on every path.
+so the rest of the pipeline can still run end-to-end.
 
 Each public function returns a pandas DataFrame indexed by date.
 """
@@ -21,8 +21,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timedelta, timezone
-from io import StringIO
-from typing import Optional, Tuple
+from typing import Dict, Optional
 
 import numpy as np
 import pandas as pd
@@ -34,256 +33,410 @@ log = logging.getLogger(__name__)
 
 
 # --------------------------------------------------------------------------- #
-# Electricity load (EIA)
+# EIA Henry Hub daily spot price (the prediction target)
 # --------------------------------------------------------------------------- #
 
-def fetch_electricity_load(cfg: Config, days: int = 730) -> pd.DataFrame:
-    """Return daily electricity load for the configured region.
+EIA_BASE = "https://api.eia.gov/v2"
 
-    Real path: EIA's hourly demand series for the configured
-    respondent. We aggregate hourly → daily peak (max of the 24
-    hourly readings) since that's what Kalshi peak-load markets
-    resolve on.
 
-    Synthetic fallback: produces a daily peak series with seasonal
-    cycle + weekday pattern + Gaussian noise. Calibrated so summer/
-    winter peaks roughly match the region's reference values.
+def fetch_natgas_henry_hub(cfg: Config, days: int = 1095) -> pd.DataFrame:
+    """Henry Hub natural gas spot price, daily, $/MMBTU.
+
+    Real path: EIA series ``NG.RNGWHHD.D`` via /seriesid endpoint.
+    Synthetic fallback: AR(1) random walk anchored at $3/MMBTU with
+    weather-correlated shocks (driven by the unified panel).
+
+    Returns DataFrame indexed by date with column
+    ``natgas_henry_hub_usd_mmbtu``.
     """
     if cfg.eia_api_key:
         try:
-            return _fetch_eia_load_real(cfg, days=days)
+            return _fetch_eia_henry_hub_real(cfg, days=days)
         except Exception as exc:  # noqa: BLE001
-            log.warning("EIA load fetch failed (%s); falling back to synthetic", exc)
+            log.warning("EIA Henry Hub fetch failed (%s); using synthetic", exc)
     if not cfg.use_synthetic_when_missing:
-        raise RuntimeError("EIA_API_KEY not set and synthetic fallback disabled")
-    return _synthetic_load(cfg, days=days)
+        raise RuntimeError("EIA_API_KEY not set and synthetic fallback off")
+    return _synthetic_henry_hub(cfg, days=days)
 
 
-def _fetch_eia_load_real(cfg: Config, days: int) -> pd.DataFrame:
-    """Real EIA call. Pulls hourly demand for the respondent and
-    rolls up to daily peak.
-
-    Endpoint: /v2/electricity/rto/region-data/data/
-      filter:  respondent={cfg.region_meta['eia_respondent']}
-               type=D  (demand, MWh)
-               frequency=hourly
-
-    EIA rate-limits aggressively so we ask for the date range in one
-    call. For a > 1-year request the API returns up to 5000 rows per
-    page; loop until done.
-    """
+def _fetch_eia_henry_hub_real(cfg: Config, days: int) -> pd.DataFrame:
     end = datetime.now(timezone.utc).date()
     start = end - timedelta(days=days)
-    base = "https://api.eia.gov/v2/electricity/rto/region-data/data/"
-    rows: list = []
-    offset = 0
-    while True:
-        params = {
-            "api_key": cfg.eia_api_key,
-            "frequency": "hourly",
-            "data[0]": "value",
-            "facets[respondent][]": cfg.region_meta["eia_respondent"],
-            "facets[type][]": "D",
-            "start": start.isoformat() + "T00",
-            "end": end.isoformat() + "T23",
-            "sort[0][column]": "period",
-            "sort[0][direction]": "asc",
-            "offset": offset,
-            "length": 5000,
-        }
-        r = requests.get(base, params=params, timeout=30)
-        r.raise_for_status()
-        page = r.json().get("response", {}).get("data", [])
-        if not page:
-            break
-        rows.extend(page)
-        if len(page) < 5000:
-            break
-        offset += 5000
-
+    url = f"{EIA_BASE}/seriesid/NG.RNGWHHD.D"
+    params = {
+        "api_key": cfg.eia_api_key,
+        "start": start.isoformat(),
+        "end": end.isoformat(),
+        "length": 5000,
+    }
+    r = requests.get(url, params=params, timeout=30)
+    r.raise_for_status()
+    rows = r.json().get("response", {}).get("data", []) or []
     if not rows:
-        raise RuntimeError("EIA returned no rows")
+        raise RuntimeError("EIA Henry Hub returned no rows")
     df = pd.DataFrame(rows)
-    df["period"] = pd.to_datetime(df["period"])
+    df["period"] = pd.to_datetime(df["period"]).dt.normalize()
     df["value"] = pd.to_numeric(df["value"], errors="coerce")
-    df["date"] = df["period"].dt.tz_localize(None).dt.normalize()
-    daily = df.groupby("date")["value"].max().rename("daily_peak_load_mw")
-    return daily.to_frame()
+    return (df.set_index("period")[["value"]]
+              .rename(columns={"value": "natgas_henry_hub_usd_mmbtu"})
+              .sort_index())
 
 
-def _synthetic_load(cfg: Config, days: int) -> pd.DataFrame:
-    """Synthetic load — slice the unified panel."""
-    return _synthetic_panel(cfg, days)[["daily_peak_load_mw"]]
+def _synthetic_henry_hub(cfg: Config, days: int) -> pd.DataFrame:
+    return _synthetic_panel(cfg, days)[["natgas_henry_hub_usd_mmbtu"]]
 
 
 # --------------------------------------------------------------------------- #
-# Weather (NOAA observed history + OpenWeather forecast)
+# EIA weekly storage report — strongest single feature for NG prices
 # --------------------------------------------------------------------------- #
 
-def fetch_weather_history(cfg: Config, days: int = 730) -> pd.DataFrame:
-    """Daily observed weather for the region's reference station.
+def fetch_natgas_storage(cfg: Config, days: int = 1095) -> pd.DataFrame:
+    """Weekly NG underground storage, lower-48 working gas (Bcf).
 
-    Real path: NOAA Climate Data Online. We pull daily summaries
-    (TMAX, TMIN, TAVG) plus humidity/dew-point from the configured
-    station. Free token, free data.
+    Real path: EIA series NG.NW2_EPG0_SWO_R48_BCF.W (released Thursdays
+    ~10:30am ET, settlement-relevant for the trading days that follow).
 
-    Synthetic fallback: daily temperature with seasonal sinusoid +
-    weekday-independent noise. Humidity/dew-point derived as
-    plausible functions of temperature.
+    Forward-filled to daily index so it joins on the daily panel.
+    """
+    if cfg.eia_api_key:
+        try:
+            return _fetch_eia_storage_real(cfg, days=days)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("EIA storage fetch failed (%s); using synthetic", exc)
+    if not cfg.use_synthetic_when_missing:
+        return pd.DataFrame()
+    return _synthetic_storage(cfg, days=days)
+
+
+def _fetch_eia_storage_real(cfg: Config, days: int) -> pd.DataFrame:
+    end = datetime.now(timezone.utc).date()
+    start = end - timedelta(days=days)
+    url = f"{EIA_BASE}/seriesid/NG.NW2_EPG0_SWO_R48_BCF.W"
+    params = {
+        "api_key": cfg.eia_api_key,
+        "start": start.isoformat(),
+        "end": end.isoformat(),
+        "length": 5000,
+    }
+    r = requests.get(url, params=params, timeout=30)
+    r.raise_for_status()
+    rows = r.json().get("response", {}).get("data", []) or []
+    if not rows:
+        raise RuntimeError("EIA storage returned no rows")
+    df = pd.DataFrame(rows)
+    df["period"] = pd.to_datetime(df["period"]).dt.normalize()
+    df["value"] = pd.to_numeric(df["value"], errors="coerce")
+    weekly = (df.set_index("period")[["value"]]
+                .rename(columns={"value": "ng_storage_bcf"})
+                .sort_index())
+    daily_index = pd.date_range(weekly.index.min(),
+                                 weekly.index.max() + pd.Timedelta(days=10),
+                                 freq="D")
+    daily = weekly.reindex(daily_index).ffill()
+    daily.index.name = "date"
+    return daily
+
+
+def _synthetic_storage(cfg: Config, days: int) -> pd.DataFrame:
+    end = pd.Timestamp.utcnow().normalize().tz_localize(None)
+    idx = pd.date_range(end - pd.Timedelta(days=days - 1), end, freq="D")
+    doy = idx.dayofyear.to_numpy(dtype=float)
+    # NG storage seasonal: peaks ~3700 Bcf late Oct, bottoms ~1400 Bcf
+    # late March (winter draw). Sinusoidal proxy.
+    seasonal = 2550 + 1100 * np.cos(2 * np.pi * (doy - 105) / 365.25)
+    rng = np.random.default_rng(seed=44)
+    noise = rng.normal(0, 80, size=len(idx))
+    return pd.DataFrame({"ng_storage_bcf": seasonal + noise},
+                        index=idx).rename_axis("date")
+
+
+# --------------------------------------------------------------------------- #
+# EIA US dry-gas production
+# --------------------------------------------------------------------------- #
+
+def fetch_natgas_production(cfg: Config, days: int = 1095) -> pd.DataFrame:
+    """US dry natural gas production, monthly Bcf/day, ffilled daily.
+
+    Real EIA series: NG.N9070US2.M. Used to capture slow supply trend
+    (shale productivity, rig activity, freeze-off events).
+    """
+    if cfg.eia_api_key:
+        try:
+            return _fetch_eia_production_real(cfg, days=days)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("EIA production fetch failed (%s); synthetic", exc)
+    if not cfg.use_synthetic_when_missing:
+        return pd.DataFrame()
+    return _synthetic_production(cfg, days=days)
+
+
+def _fetch_eia_production_real(cfg: Config, days: int) -> pd.DataFrame:
+    end = datetime.now(timezone.utc).date()
+    start = end - timedelta(days=days)
+    url = f"{EIA_BASE}/seriesid/NG.N9070US2.M"
+    params = {
+        "api_key": cfg.eia_api_key,
+        "start": start.isoformat()[:7],
+        "end": end.isoformat()[:7],
+        "length": 5000,
+    }
+    r = requests.get(url, params=params, timeout=30)
+    r.raise_for_status()
+    rows = r.json().get("response", {}).get("data", []) or []
+    if not rows:
+        raise RuntimeError("EIA production returned no rows")
+    df = pd.DataFrame(rows)
+    df["period"] = pd.to_datetime(df["period"]).dt.normalize()
+    df["value"] = pd.to_numeric(df["value"], errors="coerce")
+    monthly = (df.set_index("period")[["value"]]
+                 .rename(columns={"value": "ng_production_bcfd"})
+                 .sort_index())
+    daily_index = pd.date_range(monthly.index.min(),
+                                 monthly.index.max() + pd.Timedelta(days=40),
+                                 freq="D")
+    return monthly.reindex(daily_index).ffill()
+
+
+def _synthetic_production(cfg: Config, days: int) -> pd.DataFrame:
+    end = pd.Timestamp.utcnow().normalize().tz_localize(None)
+    idx = pd.date_range(end - pd.Timedelta(days=days - 1), end, freq="D")
+    n = len(idx)
+    trend = np.linspace(95, 103, n)
+    rng = np.random.default_rng(seed=45)
+    noise = rng.normal(0, 1.0, size=n)
+    return pd.DataFrame({"ng_production_bcfd": trend + noise},
+                        index=idx).rename_axis("date")
+
+
+# --------------------------------------------------------------------------- #
+# Consumption-weighted national weather aggregate
+# --------------------------------------------------------------------------- #
+
+def fetch_national_weather(cfg: Config, days: int = 1095) -> pd.DataFrame:
+    """Consumption-weighted national HDD / CDD aggregate.
+
+    NG demand is heating-driven in winter, power-burn-driven in summer.
+    Right weather feature is a population/consumption-weighted national
+    average, not any one city's forecast.
+
+    Returns columns:
+      national_avg_temp_f      — weighted mean daily avg temp
+      national_hdd             — heating degree days (°F below 65)
+      national_cdd             — cooling degree days (°F above 65)
+      hdd_anomaly_30d          — deviation from 30-day rolling normal
+      cdd_anomaly_30d          — same for cooling
     """
     if cfg.noaa_token:
         try:
-            return _fetch_noaa_real(cfg, days=days)
+            return _fetch_noaa_national_real(cfg, days=days)
         except Exception as exc:  # noqa: BLE001
-            log.warning("NOAA fetch failed (%s); falling back to synthetic", exc)
+            log.warning("NOAA national weather fetch failed (%s); synthetic",
+                        exc)
     if not cfg.use_synthetic_when_missing:
-        raise RuntimeError("NOAA_TOKEN not set and synthetic fallback disabled")
-    return _synthetic_weather(cfg, days=days)
+        raise RuntimeError("NOAA_TOKEN not set and synthetic fallback off")
+    return _synthetic_national_weather(cfg, days=days)
 
 
-def _fetch_noaa_real(cfg: Config, days: int) -> pd.DataFrame:
-    """NOAA CDO API stub.
+def _fetch_noaa_national_real(cfg: Config, days: int) -> pd.DataFrame:
+    """NOAA real fetch — currently a stub.
 
-    The actual call: GET /cdo-web/api/v2/data?datasetid=GHCND&...
-    Headers: {"token": NOAA_TOKEN}. Returns JSON with one row per
-    (station, date, datatype) triple. Pivot to wide format with
-    columns max_temp / min_temp / avg_temp.
-
-    Implementation deferred — current pipeline uses synthetic when
-    the real path isn't critical. Wire this up if you want full
-    historical training data from real obs. NOTE: real NOAA pulls
-    are rate-limited (5 reqs/sec, 10K rows/req) so for >1 year of
-    data you'll need to paginate by year.
+    Production wiring: GHCND daily endpoint per station, fetch TAVG (or
+    compute from TMAX/TMIN if TAVG missing), pivot, weight-average.
+    Rate-limited to 5 reqs/sec, 10K rows/req — paginate by year.
     """
     raise NotImplementedError(
-        "NOAA real fetch is a stub — wire in the GHCND endpoint here. "
-        "See https://www.ncdc.noaa.gov/cdo-web/webservices/v2"
-    )
+        "NOAA national weather fetch is a stub — wire when needed.")
 
 
-def _synthetic_weather(cfg: Config, days: int) -> pd.DataFrame:
-    """Synthetic weather — slice the unified panel."""
-    cols = ["max_temp_c", "min_temp_c", "avg_temp_c",
-            "humidity_pct", "dew_point_c"]
-    return _synthetic_panel(cfg, days)[cols]
+def _synthetic_national_weather(cfg: Config, days: int) -> pd.DataFrame:
+    panel = _synthetic_panel(cfg, days)
+    cols = ["national_avg_temp_f", "national_hdd", "national_cdd",
+            "hdd_anomaly_30d", "cdd_anomaly_30d"]
+    return panel[cols]
 
+
+# --------------------------------------------------------------------------- #
+# Weather forecast (next-day) — for inference row
+# --------------------------------------------------------------------------- #
 
 def fetch_weather_forecast(cfg: Config, days_ahead: int = 7) -> pd.DataFrame:
-    """Forecast for the next N days. Used by run_daily.py to build
-    the inference feature row.
-
-    Real path: OpenWeather One Call API or NOAA NDFD. Either is fine;
-    OpenWeather is simpler. Returns forecast peaks/lows by date.
-    Synthetic fallback: persistence (tomorrow ≈ today + small noise).
-    """
+    """National-weighted weather forecast for the next N days."""
     if cfg.openweather_api_key:
         try:
-            return _fetch_openweather_forecast_real(cfg, days_ahead=days_ahead)
+            return _fetch_openweather_national_forecast(cfg,
+                                                         days_ahead=days_ahead)
         except Exception as exc:  # noqa: BLE001
-            log.warning("OpenWeather fetch failed (%s); using persistence", exc)
-    # Persistence forecast: yesterday's weather, slightly noised.
-    history = fetch_weather_history(cfg, days=14)
-    last = history.iloc[[-1]]
+            log.warning("OpenWeather forecast failed (%s); persistence", exc)
+    history = fetch_national_weather(cfg, days=14)
+    if history.empty:
+        return pd.DataFrame()
+    last = history.iloc[-1]
     rng = np.random.default_rng()
     rows = []
     end = pd.Timestamp.utcnow().normalize().tz_localize(None)
     for d in range(1, days_ahead + 1):
+        new_temp = float(last["national_avg_temp_f"]) + rng.normal(0, 2.0)
         rows.append({
             "date": end + pd.Timedelta(days=d),
-            "max_temp_c": float(last["max_temp_c"].iloc[0]) + rng.normal(0, 1.5),
-            "min_temp_c": float(last["min_temp_c"].iloc[0]) + rng.normal(0, 1.5),
-            "avg_temp_c": float(last["avg_temp_c"].iloc[0]) + rng.normal(0, 1.0),
-            "humidity_pct": float(last["humidity_pct"].iloc[0]) + rng.normal(0, 3),
-            "dew_point_c": float(last["dew_point_c"].iloc[0]) + rng.normal(0, 1.0),
+            "national_avg_temp_f": new_temp,
+            "national_hdd": max(0, 65 - new_temp),
+            "national_cdd": max(0, new_temp - 65),
+            "hdd_anomaly_30d": float(last.get("hdd_anomaly_30d", 0.0))
+                                + rng.normal(0, 1.0),
+            "cdd_anomaly_30d": float(last.get("cdd_anomaly_30d", 0.0))
+                                + rng.normal(0, 1.0),
         })
     return pd.DataFrame(rows).set_index("date")
 
 
-def _fetch_openweather_forecast_real(cfg: Config, days_ahead: int) -> pd.DataFrame:
-    """OpenWeather One Call 3.0 forecast.
-
-    GET https://api.openweathermap.org/data/3.0/onecall
-        ?lat={lat}&lon={lon}&exclude=current,minutely,hourly,alerts
-        &units=metric&appid={key}
-
-    Returns up to 8 days of daily forecast. Map JSON 'daily' array
-    into one DataFrame row per date with the columns above.
-    Implementation deferred — same pattern as fetch_weather_history.
+def _fetch_openweather_national_forecast(cfg: Config, days_ahead: int
+                                          ) -> pd.DataFrame:
+    """OpenWeather One Call 3.0 — fetch each reference station, then
+    weight-average into the national aggregate columns.
     """
-    raise NotImplementedError(
-        "OpenWeather real fetch is a stub — wire in One Call 3.0 here.")
+    rows_by_date: Dict[pd.Timestamp, dict] = {}
+    total_weight = sum(s.get("weight", 0.0)
+                       for s in cfg.weather_reference_stations) or 1.0
+    for st in cfg.weather_reference_stations:
+        params = {
+            "lat": st["lat"], "lon": st["lon"],
+            "exclude": "current,minutely,hourly,alerts",
+            "units": "imperial",
+            "appid": cfg.openweather_api_key,
+        }
+        r = requests.get("https://api.openweathermap.org/data/3.0/onecall",
+                         params=params, timeout=15)
+        r.raise_for_status()
+        for d in (r.json().get("daily") or [])[:days_ahead]:
+            ts = pd.to_datetime(d["dt"], unit="s", utc=True
+                                 ).tz_localize(None).normalize()
+            temp = (d.get("temp") or {}).get("day", float("nan"))
+            w = st.get("weight", 0.0) / total_weight
+            row = rows_by_date.setdefault(ts,
+                                            {"temp_w": 0.0, "weight_used": 0.0})
+            row["temp_w"] += float(temp) * w
+            row["weight_used"] += w
+    out = []
+    for ts in sorted(rows_by_date):
+        r = rows_by_date[ts]
+        denom = r["weight_used"] or 1.0
+        avg = r["temp_w"] / denom
+        out.append({
+            "date": ts,
+            "national_avg_temp_f": avg,
+            "national_hdd": max(0.0, 65 - avg),
+            "national_cdd": max(0.0, avg - 65),
+            "hdd_anomaly_30d": float("nan"),
+            "cdd_anomaly_30d": float("nan"),
+        })
+    return pd.DataFrame(out).set_index("date")
 
 
 # --------------------------------------------------------------------------- #
-# Renewables (EIA Open Data — solar / wind generation by region)
+# Cross-Kalshi feature loader — implied probabilities from related markets
 # --------------------------------------------------------------------------- #
 
-def fetch_renewables(cfg: Config, days: int = 730) -> pd.DataFrame:
-    """Daily solar + wind generation totals (MWh) for the region.
+def fetch_cross_kalshi_features(cfg: Config) -> pd.Series:
+    """Pull current implied probabilities from cross-Kalshi feature
+    series defined in cfg.cross_kalshi_series.
 
-    Real path: EIA hourly fuel-type series, type=NG (net gen),
-    fueltype=SUN / WND, aggregated to daily totals.
+    For each series: average yes_ask across all currently-open markets
+    to get an aggregate "consensus probability". This is a SNAPSHOT
+    feature (same value for all rows on the inference date). Walk-
+    forward selection prunes channels that don't add signal.
 
-    Synthetic fallback: solar = positive function of (avg_temp +
-    summer_bias), wind = noise around regional mean. Returns NaN
-    columns if neither path is available so feature builders can
-    skip cleanly.
+    Returns a pandas Series with one entry per (label, derived stat)
+    pair. Dormant series produce NaN so the median imputer fills.
     """
-    if cfg.eia_api_key:
+    out: Dict[str, float] = {}
+    if not (cfg.kalshi_api_key_id and cfg.kalshi_private_key_path):
+        return pd.Series(dtype=float)
+    from .kalshi import _SignedClient
+    try:
+        client = _SignedClient(cfg)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Kalshi cross-feature client init failed: %s", exc)
+        return pd.Series(dtype=float)
+    for series_ticker, label, _why in cfg.cross_kalshi_series:
         try:
-            return _fetch_eia_renewables_real(cfg, days=days)
+            resp = client.get("/markets",
+                               params={"series_ticker": series_ticker,
+                                        "status": "open", "limit": 200})
+            ms = resp.get("markets", []) or []
+            asks = []
+            vols = []
+            for m in ms:
+                # Read price using both legacy int field + newer
+                # ``_dollars`` string field. Many low-liquidity markets
+                # only have the dollar form populated.
+                price = _market_price_prob(m)
+                if price is not None:
+                    asks.append(price)
+                v = m.get("volume") or m.get("volume_fp") or 0
+                try:
+                    vols.append(int(float(v)) if v else 0)
+                except (TypeError, ValueError):
+                    vols.append(0)
+            # n_open populates even when prices are missing — count of
+            # open markets is its own signal channel.
+            out[f"xk_{label}_n_open"] = float(len(ms))
+            out[f"xk_{label}_vol_sum"] = float(sum(vols))
+            if asks:
+                out[f"xk_{label}_avg_prob"] = float(np.mean(asks))
+                out[f"xk_{label}_max_prob"] = float(np.max(asks))
+            else:
+                out[f"xk_{label}_avg_prob"] = float("nan")
+                out[f"xk_{label}_max_prob"] = float("nan")
         except Exception as exc:  # noqa: BLE001
-            log.warning("EIA renewables fetch failed (%s); using synthetic",
-                        exc)
-    if not cfg.use_synthetic_when_missing:
-        # Return empty frame — features.py handles missing renewables.
-        return pd.DataFrame(index=pd.DatetimeIndex([], name="date"))
-    return _synthetic_renewables(cfg, days=days)
+            log.debug("cross-Kalshi fetch failed for %s: %s",
+                      series_ticker, exc)
+    return pd.Series(out, dtype=float)
 
 
-def _fetch_eia_renewables_real(cfg: Config, days: int) -> pd.DataFrame:
-    """EIA solar + wind generation. Same endpoint as load, with
-    fueltype facet. Stub — wire in identical to _fetch_eia_load_real
-    but filter on fueltype=SUN and fueltype=WND, then merge on date."""
-    raise NotImplementedError(
-        "EIA renewables fetch is a stub — copy _fetch_eia_load_real "
-        "shape with fueltype facet (SUN / WND) and merge by date.")
-
-
-def _synthetic_renewables(cfg: Config, days: int) -> pd.DataFrame:
-    """Synthetic renewables — slice the unified panel."""
-    cols = ["solar_generation_mw", "wind_generation_mw"]
-    return _synthetic_panel(cfg, days)[cols]
+def _market_price_prob(m: dict) -> Optional[float]:
+    """Extract a probability (0..1) from a Kalshi market dict, trying
+    yes_ask → yes_ask_dollars → last_price_dollars → midpoint(bid, ask)
+    in that order. Returns None when no price is available.
+    """
+    ya = m.get("yes_ask")
+    if ya not in (None, ""):
+        try:
+            return float(ya) / 100.0
+        except (TypeError, ValueError):
+            pass
+    for k in ("yes_ask_dollars", "last_price_dollars"):
+        v = m.get(k)
+        if v not in (None, ""):
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                continue
+    bid = m.get("yes_bid_dollars")
+    ask = m.get("yes_ask_dollars")
+    if bid not in (None, "") and ask not in (None, ""):
+        try:
+            return (float(bid) + float(ask)) / 2.0
+        except (TypeError, ValueError):
+            pass
+    return None
 
 
 # --------------------------------------------------------------------------- #
-# Unified synthetic panel — load is DRIVEN BY weather + weekday + noise
+# Unified synthetic panel — NG price DRIVEN BY weather + storage + noise
 # --------------------------------------------------------------------------- #
 
 _SYNTH_CACHE: dict = {}
 
 
 def _synthetic_panel(cfg: Config, days: int) -> pd.DataFrame:
-    """Generate a unified synthetic panel: weather + load + renewables
-    that are CONSISTENT with each other.
+    """Generate a unified synthetic panel where NG price is a function
+    of weather (HDD/CDD), storage deviation, and AR shocks.
 
-    The previous version generated load and weather independently with
-    different RNG seeds, so the model could trivially fit load from
-    calendar features alone (the synthetic load formula was
-    deterministic-in-calendar-features-plus-Gaussian-noise). That
-    produced fake R²=1.0 metrics.
-
-    Now: weather is generated first with realistic AR(1) day-to-day
-    structure, then load is computed as a function of weather (CDD,
-    HDD, heat index amplification) plus a weekday adjustment plus
-    irreducible noise. The model NEEDS the weather features to do
-    well, and even with all of them the noise floor caps R² in the
-    realistic 0.85-0.92 range and MAE in the 500-1500 MW range.
-
-    Cached per-(region, days) so all three loaders return aligned data
-    without re-generating.
+    The model needs weather + storage features to fit well; calendar
+    features alone won't because the AR + irreducible noise stops a
+    free lunch. Cached per-`days`.
     """
-    key = (cfg.region, days)
+    key = days
     if key in _SYNTH_CACHE:
         return _SYNTH_CACHE[key]
 
@@ -293,83 +446,57 @@ def _synthetic_panel(cfg: Config, days: int) -> pd.DataFrame:
     n = len(idx)
     doy = idx.dayofyear.to_numpy(dtype=float)
 
-    # ── Weather ─────────────────────────────────────────────────────
-    # Temperature: seasonal trajectory + AR(1) shocks. Real temperature
-    # series are highly persistent day-to-day (lag-1 corr ~0.85-0.92),
-    # which is why short-term weather forecasting works at all.
-    seasonal_temp = 15 + 15 * np.cos(2 * np.pi * (doy - 200) / 365.25) * -1
+    # ── Weather: nationally-weighted average temp °F ────────────────
+    seasonal_temp = 55 + 25 * np.cos(2 * np.pi * (doy - 200) / 365.25) * -1
     ar_phi = 0.85
     shocks = rng.normal(0, 5, size=n)
-    ar_residuals = np.zeros(n)
+    ar = np.zeros(n)
     for i in range(1, n):
-        ar_residuals[i] = (ar_phi * ar_residuals[i - 1]
-                           + shocks[i] * np.sqrt(1 - ar_phi ** 2))
-    avg_c = seasonal_temp + ar_residuals
-    diurnal = rng.uniform(4, 10, size=n)
-    max_c = avg_c + diurnal / 2
-    min_c = avg_c - diurnal / 2
-
-    # Humidity: summer-heavy with its own AR(1) noise. Independent
-    # enough from temperature that it adds real predictive content.
-    seasonal_hum = 50 + 15 * np.cos(2 * np.pi * (doy - 200) / 365.25) * -1
-    hum_shocks = rng.normal(0, 8, size=n)
-    hum_ar = np.zeros(n)
-    for i in range(1, n):
-        hum_ar[i] = 0.6 * hum_ar[i - 1] + hum_shocks[i] * np.sqrt(1 - 0.6 ** 2)
-    humidity = np.clip(seasonal_hum + hum_ar, 20, 95)
-    dew_c = avg_c - (100 - humidity) / 5.0
-
-    # ── Load: driven by weather + weekday + irreducible noise ──────
-    # Real-world load on hot days is roughly linear in CDD with a
-    # nonlinear humidity boost on top. We mimic that. Coefficients
-    # are calibrated so peak summer (CDD~25) hits the region's
-    # summer_peak and peak winter (HDD~30) hits winter_peak.
-    summer_peak = cfg.region_meta["summer_peak_mw"]
-    winter_peak = cfg.region_meta["winter_peak_mw"]
-    base = (summer_peak + winter_peak) * 0.45  # baseline (mild weather)
-    avg_f = avg_c * 9 / 5 + 32
-    cdd = np.maximum(avg_f - 65, 0)
+        ar[i] = ar_phi * ar[i - 1] + shocks[i] * np.sqrt(1 - ar_phi ** 2)
+    avg_f = seasonal_temp + ar
     hdd = np.maximum(65 - avg_f, 0)
-    cdd_coef = (summer_peak - base) / 25.0
-    hdd_coef = (winter_peak - base) / 30.0
-    weekday = idx.weekday.to_numpy(dtype=float)
-    weekday_factor = np.where(weekday < 5, 1.0, 0.93)  # weekend ~7% lower
-    # Heat-index nonlinearity: hot + humid days drive AC harder than
-    # hot + dry days at the same temperature.
-    humidity_boost = np.where(
-        (avg_f > 80) & (humidity > 60),
-        1 + (humidity - 60) / 250,        # up to +14% boost at 95% RH
-        1.0,
-    )
-    # Holiday discount: federal holidays look like Sundays in load.
-    from .features import HOLIDAY_SET
-    is_holiday = np.array([d.date() in HOLIDAY_SET for d in idx],
-                          dtype=float)
-    holiday_factor = np.where(is_holiday > 0, 0.93, 1.0)
-    # Irreducible noise — this is what stops R² from being 1.0. Real
-    # 1-day-ahead load forecasts get MAPE ~2-4% on a good day; we use
-    # 4% Gaussian as a slightly looser proxy.
-    noise = rng.normal(0, 0.04, size=n)
-    load = (
-        (base + cdd * cdd_coef + hdd * hdd_coef)
-        * weekday_factor * humidity_boost * holiday_factor
-        * (1 + noise)
-    )
-    load = np.clip(load, base * 0.5, max(summer_peak, winter_peak) * 1.4)
+    cdd = np.maximum(avg_f - 65, 0)
+    hdd_norm = (pd.Series(hdd, index=idx)
+                .rolling(30, min_periods=10).mean().values)
+    cdd_norm = (pd.Series(cdd, index=idx)
+                .rolling(30, min_periods=10).mean().values)
+    hdd_anom = hdd - np.nan_to_num(hdd_norm, nan=hdd.mean())
+    cdd_anom = cdd - np.nan_to_num(cdd_norm, nan=cdd.mean())
 
-    # ── Renewables ──────────────────────────────────────────────────
-    summer_factor = (np.cos(2 * np.pi * (doy - 200) / 365.25) * -1 + 1) / 2
-    solar = summer_peak * 0.08 * summer_factor + rng.normal(
-        0, summer_peak * 0.008, size=n)
-    wind = summer_peak * 0.06 + rng.normal(
-        0, summer_peak * 0.018, size=n)
+    # ── Storage: seasonal + responsive to weather shocks ───────────
+    seasonal_storage = 2550 + 1100 * np.cos(2 * np.pi * (doy - 105) / 365.25)
+    storage_noise = rng.normal(0, 60, size=n)
+    storage = seasonal_storage + storage_noise
+
+    # ── NG production: slow upward trend ───────────────────────────
+    production = np.linspace(95, 103, n) + rng.normal(0, 1.0, size=n)
+
+    # ── NG price: weather + storage deficit + AR(1) shocks ────────
+    base_price = 3.00
+    hdd_premium = hdd_anom * 0.015
+    cdd_premium = cdd_anom * 0.012
+    storage_5y_avg = seasonal_storage
+    storage_deficit = (storage_5y_avg - storage) / 100.0
+    storage_premium = storage_deficit * 0.03
+    price_shocks = rng.normal(0, 0.10, size=n)
+    price_ar = np.zeros(n)
+    for i in range(1, n):
+        price_ar[i] = (0.78 * price_ar[i - 1]
+                        + price_shocks[i] * np.sqrt(1 - 0.78 ** 2))
+    price = (base_price + hdd_premium + cdd_premium
+             + storage_premium + price_ar)
+    price = np.clip(price, 1.50, 12.00)
 
     panel = pd.DataFrame({
-        "daily_peak_load_mw": load,
-        "max_temp_c": max_c, "min_temp_c": min_c, "avg_temp_c": avg_c,
-        "humidity_pct": humidity, "dew_point_c": dew_c,
-        "solar_generation_mw": np.clip(solar, 0, None),
-        "wind_generation_mw": np.clip(wind, 0, None),
+        "natgas_henry_hub_usd_mmbtu": price,
+        "national_avg_temp_f": avg_f,
+        "national_hdd": hdd,
+        "national_cdd": cdd,
+        "hdd_anomaly_30d": hdd_anom,
+        "cdd_anomaly_30d": cdd_anom,
+        "ng_storage_bcf": storage,
+        "ng_storage_5y_avg_bcf": storage_5y_avg,
+        "ng_production_bcfd": production,
     }, index=idx).rename_axis("date")
 
     _SYNTH_CACHE[key] = panel
@@ -381,24 +508,34 @@ def _synthetic_panel(cfg: Config, days: int) -> pd.DataFrame:
 # --------------------------------------------------------------------------- #
 
 def build_panel(cfg: Config, days: Optional[int] = None) -> pd.DataFrame:
-    """Join load + weather + renewables into one daily panel.
+    """Join NG price + storage + production + weather into a daily panel.
 
-    The panel is the input to features.py. Each row corresponds to
-    one calendar date; columns are everything the model can see at
-    or before that date's PEAK HOUR.
+    Cross-Kalshi features are NOT added here — they're a snapshot at
+    inference time, plumbed through `build_today_row`. (At training
+    time we don't have a historical Kalshi market-price archive yet;
+    that's a future enhancement.)
     """
     days = days or cfg.history_days_for_training
-    load = fetch_electricity_load(cfg, days=days)
-    weather = fetch_weather_history(cfg, days=days)
-    renew = fetch_renewables(cfg, days=days)
-    panel = load.join(weather, how="outer").join(renew, how="outer")
+    price = fetch_natgas_henry_hub(cfg, days=days)
+    storage = fetch_natgas_storage(cfg, days=days)
+    production = fetch_natgas_production(cfg, days=days)
+    weather = fetch_national_weather(cfg, days=days)
+    panel = (price
+             .join(storage, how="outer")
+             .join(production, how="outer")
+             .join(weather, how="outer"))
     panel = panel.sort_index()
-    # Net peak: load minus solar+wind generation. Useful target if we
-    # have renewable data, otherwise NaN.
-    if "solar_generation_mw" in panel.columns and "wind_generation_mw" in panel.columns:
-        panel["net_peak_load_mw"] = (
-            panel["daily_peak_load_mw"]
-            - panel["solar_generation_mw"]
-            - panel["wind_generation_mw"]
-        )
+    # Trim to the requested window. EIA's /seriesid endpoint returns
+    # the full historical series regardless of start/end params (~5000
+    # rows for daily NG since 2006), so the join produces a 20-year
+    # panel even when we only want 3 years. Trim explicitly so weather
+    # / storage NaN rows from far-history don't pollute training (the
+    # median imputer would otherwise cancel out the weather signal).
+    cutoff = pd.Timestamp.utcnow().normalize().tz_localize(None) \
+              - pd.Timedelta(days=days)
+    panel = panel.loc[panel.index >= cutoff]
+    if ("ng_storage_bcf" in panel.columns
+            and "ng_storage_5y_avg_bcf" in panel.columns):
+        panel["ng_storage_deviation_bcf"] = (
+            panel["ng_storage_bcf"] - panel["ng_storage_5y_avg_bcf"])
     return panel

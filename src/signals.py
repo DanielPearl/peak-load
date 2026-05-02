@@ -19,7 +19,7 @@ log = logging.getLogger(__name__)
 @dataclass
 class Signal:
     ticker: str
-    threshold_mw: Optional[int]
+    threshold_value: Optional[float]
     yes_sub_title: str
     model_prob: float
     kalshi_implied_prob: float
@@ -41,12 +41,12 @@ def implied_prob(yes_price_cents: Optional[int]) -> Optional[float]:
 
 
 def compute_signal(cfg: Config, market: KalshiMarket,
-                   threshold_probs: Dict[int, float]) -> Signal:
+                   threshold_probs: Dict[float, float]) -> Signal:
     """Compute the trade signal for one Kalshi market.
 
     Inputs:
       market           Kalshi market (from kalshi.py)
-      threshold_probs  dict[threshold_mw -> model_prob], from
+      threshold_probs  dict[threshold_value -> model_prob], from
                        model.threshold_probabilities()
 
     Returns a Signal with decision in {BUY_YES, BUY_NO, NO_TRADE}.
@@ -60,7 +60,7 @@ def compute_signal(cfg: Config, market: KalshiMarket,
     "edge_yes" / "edge_no" if we trade). Helpful for diagnostics
     when scanning the daily output for "why didn't we bet?".
     """
-    thr = market.threshold_mw
+    thr = market.threshold_value
     if thr is None or thr not in threshold_probs:
         return _no_trade(market, 0.0, 0.0,
                          "no_threshold_match")
@@ -101,7 +101,7 @@ def compute_signal(cfg: Config, market: KalshiMarket,
 
 
 def compute_signals(cfg: Config, markets: List[KalshiMarket],
-                    threshold_probs: Dict[int, float]) -> List[Signal]:
+                    threshold_probs: Dict[float, float]) -> List[Signal]:
     """Run compute_signal across a market list, return all signals."""
     return [compute_signal(cfg, m, threshold_probs) for m in markets]
 
@@ -114,7 +114,7 @@ def _trade(market: KalshiMarket, model_p: float, kalshi_p: float,
            edge: float, spread: Optional[int],
            decision: str, reason: str) -> Signal:
     return Signal(
-        ticker=market.ticker, threshold_mw=market.threshold_mw,
+        ticker=market.ticker, threshold_value=market.threshold_value,
         yes_sub_title=market.yes_sub_title,
         model_prob=model_p, kalshi_implied_prob=kalshi_p, edge=edge,
         yes_ask_cents=market.yes_ask_cents, no_ask_cents=market.no_ask_cents,
@@ -127,7 +127,7 @@ def _no_trade(market: KalshiMarket, model_p: float, kalshi_p: float,
               reason: str, edge: float = 0.0,
               spread: Optional[int] = None) -> Signal:
     return Signal(
-        ticker=market.ticker, threshold_mw=market.threshold_mw,
+        ticker=market.ticker, threshold_value=market.threshold_value,
         yes_sub_title=market.yes_sub_title,
         model_prob=model_p, kalshi_implied_prob=kalshi_p, edge=edge,
         yes_ask_cents=market.yes_ask_cents, no_ask_cents=market.no_ask_cents,

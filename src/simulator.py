@@ -1,4 +1,4 @@
-"""Paper-trading simulator for the peak-load bot.
+"""Paper-trading simulator for the natural-gas-price bot.
 
 When a daily signal clears all gates the bot opens a 1-contract
 position here. Positions persist across runs (SQLite-backed), so
@@ -8,7 +8,7 @@ closed.
 
 Schema mirrors the gas-prices / unemployment-claims simulator schemas
 on the columns the unified dashboard reads — that lets the dashboard
-render peak-load active bets + history through the same code path as
+render natural-gas-price active bets + history through the same code path as
 the other bots, no special-casing required.
 """
 from __future__ import annotations
@@ -39,9 +39,9 @@ CREATE TABLE IF NOT EXISTS positions (
     exited_at TEXT,
     realized_pnl_cents INTEGER,
     decision_json TEXT,
-    -- Peak-load specific context.
-    threshold_mw REAL,
-    forecast_mw REAL,
+    -- Trade context: strike, today's forecast, and signal edge.
+    threshold_value REAL,
+    forecast_value REAL,
     signal_edge REAL,
     -- Hedge tracking. NULL → no hedge fired; non-null → id of the
     -- hedge position that locked in P&L (or capped loss). A position
@@ -125,8 +125,8 @@ CREATE INDEX IF NOT EXISTS idx_views_ticker ON market_views(ticker, captured_at 
 """
 
 
-class PeakLoadSimulator:
-    """Tracks positions and trades for the daily peak-load bot.
+class NatGasSimulator:
+    """Tracks positions and trades for the daily natural-gas-price bot.
 
     Idempotent across runs: opening on a ticker that already has an
     open position is a no-op; closing logic only fires when the market
@@ -206,8 +206,8 @@ class PeakLoadSimulator:
         side: str,
         ask_cents: int,
         decision_metadata: Optional[dict] = None,
-        threshold_mw: Optional[float] = None,
-        forecast_mw: Optional[float] = None,
+        threshold_value: Optional[float] = None,
+        forecast_value: Optional[float] = None,
         signal_edge: Optional[float] = None,
     ) -> Optional[int]:
         ok, why = self.can_open_new(ticker, ask_cents)
@@ -222,10 +222,10 @@ class PeakLoadSimulator:
             cur = c.execute(
                 "INSERT INTO positions("
                 "  ticker, side, entry_price_cents, contracts, opened_at, "
-                "  status, decision_json, threshold_mw, forecast_mw, signal_edge"
+                "  status, decision_json, threshold_value, forecast_value, signal_edge"
                 ") VALUES (?, ?, ?, ?, ?, 'open', ?, ?, ?, ?)",
                 (ticker, side, ask_cents, contracts, now, decision_json,
-                 threshold_mw, forecast_mw, signal_edge),
+                 threshold_value, forecast_value, signal_edge),
             )
             pid = cur.lastrowid
             c.execute(
@@ -323,12 +323,12 @@ class PeakLoadSimulator:
             cur = c.execute(
                 "INSERT INTO positions("
                 "  ticker, side, entry_price_cents, contracts, opened_at, "
-                "  status, decision_json, threshold_mw, forecast_mw, "
+                "  status, decision_json, threshold_value, forecast_value, "
                 "  signal_edge, hedge_id"
                 ") VALUES (?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, NULL)",
                 (position["ticker"], hedge_side, other_ask, hedge_contracts,
                  now, '{"kind":"hedge"}',
-                 position["threshold_mw"], position["forecast_mw"],
+                 position["threshold_value"], position["forecast_value"],
                  position["signal_edge"]),
             )
             hedge_pid = cur.lastrowid
@@ -355,9 +355,9 @@ class PeakLoadSimulator:
     # ── Snapshots / views (mirrors run_daily's previous inline writes) ─
 
     def record_model_snapshot(
-        self, *, forecast_mw: float, residual_std: float,
+        self, *, forecast_value: float, residual_std: float,
         median_threshold_prob: float, n_features: int,
-        r2: float, mae_mw: float, rmse_mw: float,
+        r2: float, mae: float, rmse: float,
     ) -> None:
         """One row per daily run, populated for the dashboard's
         Model section."""
@@ -371,16 +371,16 @@ class PeakLoadSimulator:
                 "  training_precision, training_recall, training_f1, "
                 "  training_roc_auc"
                 ") VALUES (?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (now, forecast_mw, forecast_mw, median_threshold_prob,
-                 forecast_mw - 1.645 * residual_std,
-                 forecast_mw,
-                 forecast_mw + 1.645 * residual_std,
+                (now, forecast_value, forecast_value, median_threshold_prob,
+                 forecast_value - 1.645 * residual_std,
+                 forecast_value,
+                 forecast_value + 1.645 * residual_std,
                  residual_std, n_features,
                  r2, r2, r2, r2, r2),   # placeholders — Model section
             )                            # cards just need non-zero values
 
     def record_market_view(
-        self, *, ticker: str, title: str, threshold_mw: Optional[float],
+        self, *, ticker: str, title: str, threshold_value: Optional[float],
         minutes_to_close: float, model_prob_yes: float,
         yes_ask_cents: Optional[int], no_ask_cents: Optional[int],
         spread_cents: Optional[int], edge: float,
@@ -398,7 +398,7 @@ class PeakLoadSimulator:
                 "  volume, open_interest, raw_model_prob_yes"
                 ") VALUES (?, ?, ?, 'above', ?, NULL, ?, ?, ?, ?, ?, "
                 "         ?, ?, ?, ?, ?, ?, ?)",
-                (now, ticker, title, threshold_mw, minutes_to_close,
+                (now, ticker, title, threshold_value, minutes_to_close,
                  model_prob_yes, yes_ask_cents, no_ask_cents, spread_cents,
                  edge if edge >= 0 else None,
                  -edge if edge < 0 else None,

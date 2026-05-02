@@ -1,4 +1,4 @@
-"""Pre-trade validators for the peak-load bot.
+"""Pre-trade validators for the natural-gas-price bot.
 
 Same shape as the gas-prices / unemployment-claims validator: each
 gate returns ``(ok: bool, reason: str)``; the first failure short-
@@ -21,35 +21,33 @@ from .kalshi import KalshiMarket
 @dataclass
 class ValidatorCfg:
     # Liquidity gates — same intent as the other bots.
-    min_volume: int = 50               # lifetime contracts traded
-    min_open_interest: int = 50        # currently-held contracts
-    max_spread_cents: int = 8          # round-trip spread cost
+    min_volume: int = 25               # NG strikes thinner than load markets
+    min_open_interest: int = 25
+    max_spread_cents: int = 10         # NG spreads wider than electricity
     # Price-band gate. Skip deep-in / deep-out tail markets where
     # asymmetric payoffs make the edge fragile.
     prob_bounds_cents: Tuple[int, int] = (5, 95)
-    # Time gate. Peak-load markets typically resolve at end of day
-    # so there's no "too far out" issue, but a minimum gives us
-    # breathing room against minute-to-resolution noise.
+    # Time gate. Daily NG markets close at 5pm EDT, so minimum gives
+    # breathing room against minute-to-settlement noise.
     min_minutes_to_close: int = 30
     max_minutes_to_close: int = 60 * 24 * 7   # 7d ceiling for safety
-    # Forecast-anchor basis-risk gate. Skip strikes within ±X MW of
-    # the model's forecast when very close to close — the difference
-    # between the model's forecast (off our weather forecast) and
-    # actual realized peak load is dominated by forecast error there,
-    # not real edge.
-    basis_risk_strike_window_mw: float = 1500
+    # Forecast-anchor basis-risk gate. Skip strikes within ±X $/MMBTU
+    # of the model's forecast when very close to close — settlement-
+    # print noise dominates the edge there. Default 5¢ (matches Kalshi
+    # tick spacing of $0.005 × 10 = a comfortable buffer).
+    basis_risk_strike_window: float = 0.05
     basis_risk_max_hours_to_close: float = 4
 
 
 def validate_market(
     market: KalshiMarket,
     cfg: ValidatorCfg,
-    forecast_mw: Optional[float] = None,
+    forecast_value: Optional[float] = None,
     minutes_to_close: Optional[float] = None,
 ) -> Tuple[bool, str]:
     """Returns (ok, reason). First-fail-wins so logs are audit-friendly."""
     # Threshold parsed?
-    if market.threshold_mw is None:
+    if market.threshold_value is None:
         return False, "no_threshold_match"
 
     # Liquidity.
@@ -82,16 +80,16 @@ def validate_market(
     # Basis-risk gate. Strikes near the forecast value within the
     # last few hours have edges dominated by forecast error rather
     # than genuine model conviction.
-    if (cfg.basis_risk_strike_window_mw > 0
+    if (cfg.basis_risk_strike_window > 0
             and cfg.basis_risk_max_hours_to_close > 0
-            and forecast_mw is not None
+            and forecast_value is not None
             and minutes_to_close is not None
             and minutes_to_close < cfg.basis_risk_max_hours_to_close * 60):
-        gap = abs(market.threshold_mw - forecast_mw)
-        if gap <= cfg.basis_risk_strike_window_mw:
-            return False, (f"basis_risk_zone (strike {market.threshold_mw} "
-                           f"within {cfg.basis_risk_strike_window_mw:.0f} MW "
-                           f"of forecast {forecast_mw:.0f}, "
+        gap = abs(market.threshold_value - forecast_value)
+        if gap <= cfg.basis_risk_strike_window:
+            return False, (f"basis_risk_zone (strike ${market.threshold_value:.3f} "
+                           f"within ${cfg.basis_risk_strike_window:.3f}/MMBTU "
+                           f"of forecast ${forecast_value:.3f}, "
                            f"TTC {minutes_to_close:.0f}min)")
 
     return True, "ok"
