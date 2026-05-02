@@ -115,8 +115,12 @@ class Config:
 
     # ── Validator thresholds ──────────────────────────────────────────
     val_max_spread_cents: int = 10
-    val_prob_bounds_cents_low: int = 5
-    val_prob_bounds_cents_high: int = 95
+    # Skip contracts at the extremes — at 90¢+ max upside is <10¢ and
+    # the spread eats most of it; below 15¢ probability noise dominates
+    # whatever edge the model claims. [15, 85] keeps the actionable
+    # middle band where edge can pay vs. spread cost.
+    val_prob_bounds_cents_low: int = 15
+    val_prob_bounds_cents_high: int = 85
     val_min_minutes_to_close: int = 30
     val_max_minutes_to_close: int = 60 * 24 * 7
     # Strike-window in $/MMBTU. 5¢ above/below spot is a "close to the
