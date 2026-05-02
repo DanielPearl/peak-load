@@ -1,0 +1,16 @@
+[Unit]
+Description=Run Kalshi natural-gas bot daily, plus a few intraday refreshes
+Requires=kalshi-natgas-bot.service
+
+[Timer]
+# Markets resolve at 5pm EDT (21:00 UTC). Run once first thing UTC, again
+# at noon ET, again right before close. That gives the dashboard fresh
+# model_prob_yes values through the trading day without spamming the
+# Kalshi or Pyth feeds.
+OnCalendar=*-*-* 06:00:00 UTC
+OnCalendar=*-*-* 16:00:00 UTC
+OnCalendar=*-*-* 20:30:00 UTC
+Persistent=true
+
+[Install]
+WantedBy=timers.target

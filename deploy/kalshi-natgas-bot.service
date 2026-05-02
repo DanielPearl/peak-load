@@ -1,0 +1,13 @@
+[Unit]
+Description=Kalshi natural-gas (KXNATGASD) signal bot — one-shot per day
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/root/peak-load
+EnvironmentFile=/root/peak-load/.env
+ExecStart=/root/peak-load/.venv/bin/python /root/peak-load/scripts/run_daily.py
+StandardOutput=journal
+StandardError=journal
