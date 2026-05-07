@@ -271,37 +271,41 @@ class NatGasSimulator:
     def maybe_hedge(self, position: sqlite3.Row,
                     yes_ask_cents: Optional[int],
                     no_ask_cents: Optional[int]) -> Optional[int]:
-        """Open an offsetting hedge position if price has moved enough.
+        """Hedge by CLOSING the position when price moves past the
+        profit-lock or stop-loss threshold.
 
-        Same logic as the gas-prices / unemployment-claims hedge:
-          • +profit_lock_cents in our favor → buy the OTHER side at
-            `hedge_size_fraction × original_contracts` to lock in the
-            gain (the hedge's payoff will compensate if the original
-            reverses)
-          • -stop_loss_cents against → same hedge, capping further
-            downside
+        Earlier versions of this bot opened an OFFSETTING position on
+        the same ticker — which left the dashboard showing two open
+        rows per hedged trade (the original NO + the offsetting YES,
+        or vice versa). That violated the "one bet per contract
+        grouping" invariant the other bots maintain (gas-prices,
+        unemployment-claims, CPI all close on hedge instead of opening
+        an offset). Aligned this bot to that pattern.
 
-        A position can be hedged at most once (`hedge_id` non-null).
-        Returns the new hedge position's pid if one fired, None otherwise.
+        Triggers (unchanged):
+          • +profit_lock_cents in our favor → close at current ask,
+            lock in the realized gain.
+          • -stop_loss_cents against → close at current ask, cap
+            further downside.
+
+        Returns the closed position's id if a hedge fired, None otherwise.
         """
         if not self.cfg.hedge_enabled:
             return None
         if position["hedge_id"] is not None:
-            return None      # already hedged
+            return None      # already closed-via-hedge
+        if position["status"] != "open":
+            return None
         side = position["side"]
         entry = int(position["entry_price_cents"])
         # Current price-of-this-side ask; this is what the position is
         # worth if we wanted to exit by selling.
         if side == "YES":
             our_ask = yes_ask_cents
-            other_ask = no_ask_cents
         else:
             our_ask = no_ask_cents
-            other_ask = yes_ask_cents
-        if our_ask is None or other_ask is None:
-            return None      # no two-sided book → can't hedge
-        # In gas-prices/unemployment-claims this uses mid; for daily-
-        # cadence the ask is fine and avoids a separate bid fetch.
+        if our_ask is None:
+            return None      # no ask on our side → can't size the close
         delta_cents = our_ask - entry
         triggered = (
             delta_cents >= self.cfg.hedge_profit_lock_cents
@@ -309,48 +313,21 @@ class NatGasSimulator:
         )
         if not triggered:
             return None
-        # Fire the hedge. Open the OPPOSITE side at `other_ask`,
-        # `hedge_size_fraction × contracts`. Bypass the can_open_new
-        # gates because hedge fills are a defensive action, not a
-        # discretionary entry — they exist *because* we have an open
-        # position; the dedup gate would block them if we don't bypass.
-        original_contracts = int(position["contracts"])
-        hedge_contracts = max(1, int(round(
-            original_contracts * self.cfg.hedge_size_fraction)))
-        hedge_side = "NO" if side == "YES" else "YES"
-        now = datetime.now(timezone.utc).isoformat()
-        with closing(self._conn()) as c, c:
-            cur = c.execute(
-                "INSERT INTO positions("
-                "  ticker, side, entry_price_cents, contracts, opened_at, "
-                "  status, decision_json, threshold_value, forecast_value, "
-                "  signal_edge, hedge_id"
-                ") VALUES (?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, NULL)",
-                (position["ticker"], hedge_side, other_ask, hedge_contracts,
-                 now, '{"kind":"hedge"}',
-                 position["threshold_value"], position["forecast_value"],
-                 position["signal_edge"]),
-            )
-            hedge_pid = cur.lastrowid
-            c.execute(
-                "INSERT INTO trades(position_id, ticker, side, action, "
-                "  price_cents, contracts, created_at, kind"
-                ") VALUES (?, ?, ?, 'buy', ?, ?, ?, 'hedge')",
-                (hedge_pid, position["ticker"], hedge_side,
-                 other_ask, hedge_contracts, now),
-            )
-            # Mark the original position as hedged so we don't fire again.
-            c.execute(
-                "UPDATE positions SET hedge_id = ? WHERE id = ?",
-                (hedge_pid, position["id"]),
-            )
         reason = ("profit_lock" if delta_cents >= 0 else "stop_loss")
-        log.info("[SIM] HEDGE pid=%d %s @ %dc x%d "
-                 "(orig pid=%d %s entry=%dc, current_ask=%dc, "
-                 "Δ=%+dc → %s)",
-                 hedge_pid, hedge_side, other_ask, hedge_contracts,
+        log.info("[SIM] HEDGE-CLOSE pid=%d %s entry=%dc current=%dc "
+                 "Δ=%+dc → %s",
                  position["id"], side, entry, our_ask, delta_cents, reason)
-        return hedge_pid
+        self.close_position(int(position["id"]), int(our_ask))
+        # Stamp the original row's ``hedge_id`` so the dashboard /
+        # diagnostics can tell this position closed via hedge versus
+        # market-resolution. Self-link to id is a sentinel: "this
+        # position closed via the hedge mechanism, not via a separate
+        # offsetting position" (the legacy semantics where hedge_id
+        # pointed at an offsetting pid no longer applies).
+        with closing(self._conn()) as c, c:
+            c.execute("UPDATE positions SET hedge_id = id WHERE id = ?",
+                      (int(position["id"]),))
+        return int(position["id"])
 
     # ── Snapshots / views (mirrors run_daily's previous inline writes) ─
 
