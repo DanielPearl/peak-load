@@ -45,6 +45,10 @@ def main() -> int:
                         help="$/MMBTU step for the per-strike training grid")
     parser.add_argument("--importance-csv", default=None,
                         help="Optional path to dump feature-importance audit CSV")
+    parser.add_argument("--holdout-csv", default=None,
+                        help="Optional path to dump (prob,label) pairs from "
+                             "the held-out test set — feeds the dashboard's "
+                             "ROC + confusion matrix")
     args = parser.parse_args()
     if args.target:
         import os
@@ -63,6 +67,17 @@ def main() -> int:
     log.info("features built: %d rows × %d candidate feature cols",
              len(df), len(feature_cols))
 
+    # Default both audit files to data/ next to the bot's sim.db so the
+    # dashboard finds them without needing manual flags. The bot does
+    # not depend on either file at runtime — they are pure write-only
+    # outputs for the dashboard's Models tab.
+    importance_csv = (args.importance_csv
+                      or str(Path(cfg.model_path).parent.parent
+                             / "data" / "feature_importance.csv"))
+    holdout_csv = (args.holdout_csv
+                   or str(Path(cfg.model_path).parent.parent
+                          / "data" / "holdout_predictions.csv"))
+
     model = train_model(
         df, feature_cols,
         test_size_days=cfg.test_size_days,
@@ -71,7 +86,8 @@ def main() -> int:
         classifier_seeds=args.classifier_seeds,
         max_features=args.max_features,
         threshold_training_step_usd=args.threshold_step,
-        importance_csv_path=args.importance_csv,
+        importance_csv_path=importance_csv,
+        holdout_predictions_path=holdout_csv,
     )
 
     save_model(model, cfg.model_path)

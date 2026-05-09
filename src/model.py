@@ -387,6 +387,7 @@ def train_model(
     calibration_holdout_days: int = 60,
     random_state: int = 42,
     importance_csv_path: Optional[str] = None,
+    holdout_predictions_path: Optional[str] = None,
     meta_model_weight: float = 0.25,
     threshold_training_grid: Optional[List[float]] = None,
     threshold_training_step_usd: float = 0.10,
@@ -499,6 +500,13 @@ def train_model(
 
     threshold_classifiers: Dict[float, _ClassifierEnsemble] = {}
     threshold_metrics: Dict[float, Dict[str, float]] = {}
+    # Per-threshold (probability, label) pairs from the held-out test
+    # set, pooled across the strike ladder. Dumped at the end of the
+    # function so the dashboard's Models tab can render a single ROC +
+    # confusion matrix that summarises how well the per-strike
+    # classifier ensemble distinguishes wins from losses across every
+    # strike the bot trades.
+    holdout_pairs: List[Tuple[float, int, float]] = []
     have_holdout = len(X_train) > calibration_holdout_days + 60
     for thr in threshold_training_grid:
         y_thr_train = (y_train >= thr).astype(int)
@@ -537,6 +545,8 @@ def train_model(
             test_probs = np.mean(
                 [m.predict_proba(X_test)[:, 1] for m in members], axis=0)
             test_pred = (test_probs >= 0.5).astype(int)
+            for prob, label in zip(test_probs, y_thr_test.values):
+                holdout_pairs.append((float(prob), int(label), float(thr)))
             threshold_metrics[thr] = {
                 "n_train_pos": int(y_thr_train.sum()),
                 "n_test_pos": int(y_thr_test.sum()),
@@ -602,6 +612,25 @@ def train_model(
              pf_metrics["mae"], pf_metrics["r2"],
              avg_acc, avg_prec, avg_rec, avg_f1, avg_auc,
              len(threshold_classifiers))
+
+    # ---- 7. Holdout predictions dump for the dashboard ------------- #
+    # Same shape every other bot uses (predicted_prob,actual_label).
+    # We add a third column with the strike threshold so the file
+    # remains audit-friendly even though the dashboard ignores it.
+    if holdout_predictions_path and holdout_pairs:
+        try:
+            Path(holdout_predictions_path).parent.mkdir(
+                parents=True, exist_ok=True)
+            with open(holdout_predictions_path, "w") as f:
+                f.write("predicted_prob,actual_label,threshold\n")
+                for prob, label, thr in holdout_pairs:
+                    f.write(f"{prob:.6f},{label},{thr:.3f}\n")
+            log.info("wrote holdout predictions (%d rows across %d "
+                     "strikes) → %s",
+                     len(holdout_pairs), len(threshold_classifiers),
+                     holdout_predictions_path)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("could not dump holdout_predictions.csv: %s", exc)
 
     return NatGasModel(
         feature_columns=list(feature_columns),
