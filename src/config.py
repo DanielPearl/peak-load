@@ -55,9 +55,19 @@ CROSS_KALSHI_FEATURE_SERIES = [
     ("KXISRAELHAMAS", "israel_hamas",    "Israel/Hamas ceasefire markets"),
     ("KXVENZ",        "venezuela",       "Venezuela / Maduro markets — oil sanctions"),
     # ── Hurricane / storm — Gulf production + LNG terminal disruption ─
+    # Gulf-coast strikes hit (a) ~17% of US NG production from offshore
+    # platforms, (b) every major LNG export terminal — Sabine Pass,
+    # Corpus Christi, Cameron, Freeport, Calcasieu Pass — so any active
+    # Gulf threat is BOTH a supply hit AND an export-demand hit. Pull
+    # FL paths, the LA/TX paths where the terminals sit, and the
+    # season-total markets that proxy overall Atlantic hurricane risk.
     ("KXHURPATHFLA",  "hurr_florida",    "Hurricane hits FL"),
+    ("KXHURPATHLA",   "hurr_louisiana",  "Hurricane hits LA — Sabine/Cameron/CCP corridor"),
+    ("KXHURPATHTX",   "hurr_texas",      "Hurricane hits TX — Freeport/CCorpus corridor"),
     ("KXHURCATFL",    "hurr_warning_fl", "Hurricane warning FL"),
     ("KXHURCTOTMAJ",  "hurr_total_major","Major hurricanes total this season"),
+    ("KXHURNAMED",    "hurr_named_total","Named storms total — Atlantic season activity"),
+    ("KXHURCAT5",     "hurr_cat5",       "Any Cat-5 hurricane this season"),
     # ── Macro / Fed / policy — discount-rate effect on commodities ────
     ("KXFEDDECISION", "fed_decision",    "Fed rate decision next meeting"),
     ("KXRECESSION",   "recession",       "US recession this year"),
@@ -115,12 +125,18 @@ class Config:
 
     # ── Validator thresholds ──────────────────────────────────────────
     val_max_spread_cents: int = 10
-    # Skip contracts at the extremes — at 90¢+ max upside is <10¢ and
-    # the spread eats most of it; below 15¢ probability noise dominates
-    # whatever edge the model claims. [15, 85] keeps the actionable
-    # middle band where edge can pay vs. spread cost.
-    val_prob_bounds_cents_low: int = 15
-    val_prob_bounds_cents_high: int = 85
+    # Skip contracts at the extremes. Tightened from [15, 85] to [20, 80]:
+    # at 85c the half-spread + Kalshi fee eat ~30% of the 15c upside, and
+    # the model is least informative near the tails. [20, 80] preserves
+    # the actionable middle band without asking the model to confidently
+    # call near-certainty events.
+    val_prob_bounds_cents_low: int = 20
+    val_prob_bounds_cents_high: int = 80
+    # Hard cap on what we'll pay for either side, regardless of edge. At
+    # 75c+ the loss-vs-gain ratio is 3:1+ and a single missed call dwarfs
+    # many wins. Variance protection independent of edge math. Set 100
+    # to disable.
+    val_max_entry_price_cents: int = 75
     val_min_minutes_to_close: int = 30
     val_max_minutes_to_close: int = 60 * 24 * 7
     # Strike-window in $/MMBTU. 5¢ above/below spot is a "close to the
@@ -141,15 +157,37 @@ class Config:
     # /CDD aggregation. Weights sum to ~0.72 — the rest absorbs into
     # the synthetic baseline. Real production should refresh these
     # against EIA's gas-consumption-by-state data.
+    #
+    # The `region` tag groups stations into NG-demand regions so the
+    # feature builder can compute regional HDD/CDD aggregates. Regions
+    # match EIA's natural-gas demand reporting groups (Northeast,
+    # Midwest, South, West) plus a separate "Gulf" channel for the
+    # production/LNG-export footprint that hurricanes hit.
     weather_reference_stations: List[dict] = field(default_factory=lambda: [
-        {"name": "NYC",     "lat": 40.78, "lon": -73.97, "weight": 0.18},
-        {"name": "Chicago", "lat": 41.88, "lon": -87.63, "weight": 0.14},
-        {"name": "Houston", "lat": 29.76, "lon": -95.36, "weight": 0.10},
-        {"name": "Atlanta", "lat": 33.75, "lon": -84.39, "weight": 0.08},
-        {"name": "Boston",  "lat": 42.36, "lon": -71.06, "weight": 0.07},
-        {"name": "Phoenix", "lat": 33.45, "lon": -112.07,"weight": 0.06},
-        {"name": "Denver",  "lat": 39.74, "lon": -104.99,"weight": 0.05},
-        {"name": "Seattle", "lat": 47.61, "lon": -122.33,"weight": 0.04},
+        {"name": "NYC",     "lat": 40.78, "lon": -73.97, "weight": 0.18, "region": "northeast"},
+        {"name": "Boston",  "lat": 42.36, "lon": -71.06, "weight": 0.07, "region": "northeast"},
+        {"name": "Chicago", "lat": 41.88, "lon": -87.63, "weight": 0.14, "region": "midwest"},
+        {"name": "Atlanta", "lat": 33.75, "lon": -84.39, "weight": 0.08, "region": "south"},
+        {"name": "Houston", "lat": 29.76, "lon": -95.36, "weight": 0.10, "region": "gulf"},
+        {"name": "Phoenix", "lat": 33.45, "lon": -112.07,"weight": 0.06, "region": "west"},
+        {"name": "Denver",  "lat": 39.74, "lon": -104.99,"weight": 0.05, "region": "west"},
+        {"name": "Seattle", "lat": 47.61, "lon": -122.33,"weight": 0.04, "region": "west"},
+    ])
+
+    # LNG export-terminal weather stations. Tropical storms, fog, and
+    # high winds at these terminals disrupt loadings → bullish for
+    # domestic NG (less gas leaves the country) on the short horizon
+    # but bearish for the next monthly print (cargoes that couldn't
+    # load build up stranded gas). Weights ≈ each terminal's share of
+    # peak US LNG export capacity (~13 Bcf/day total in 2025-26).
+    lng_terminal_stations: List[dict] = field(default_factory=lambda: [
+        {"name": "Sabine_Pass",    "lat": 29.73, "lon": -93.87, "weight": 0.30},  # Cheniere LA
+        {"name": "Corpus_Christi", "lat": 27.83, "lon": -97.39, "weight": 0.18},  # Cheniere TX
+        {"name": "Cameron",        "lat": 29.78, "lon": -93.33, "weight": 0.15},  # Sempra LA
+        {"name": "Freeport",       "lat": 28.95, "lon": -95.36, "weight": 0.16},  # Freeport TX
+        {"name": "Calcasieu_Pass", "lat": 29.79, "lon": -93.34, "weight": 0.12},  # Venture Global LA
+        {"name": "Cove_Point",     "lat": 38.39, "lon": -76.40, "weight": 0.05},  # Dominion MD
+        {"name": "Elba_Island",    "lat": 32.01, "lon": -80.95, "weight": 0.04},  # Kinder Morgan GA
     ])
 
     # ── Cross-Kalshi feature markets ──────────────────────────────────

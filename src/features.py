@@ -1,7 +1,11 @@
 """Feature engineering for the Natural Gas Price prediction model.
 
 Layers:
-  1. Weather features:    HDD/CDD national, anomalies, lags, rolling.
+  1. Weather features:    HDD/CDD national + per-region, anomalies,
+                          lags, rolling means, cold/heat-wave duration
+                          counters, wind/humidity, LNG-terminal weather
+                          + storm flags, Gulf hurricane disruption,
+                          day-over-day forecast-revision deltas.
   2. Storage features:    levels, 5y deviation, change-week-over-week,
                           days-since-last-report (Thursday spike).
   3. Production features: lagged + monthly-change.
@@ -12,6 +16,12 @@ Layers:
                           pick up momentum vs. mean-reversion regimes).
   6. Cross-Kalshi features: snapshot probabilities from related Kalshi
                           markets — only populated at inference time.
+  7. Forecast revisions:  numeric deltas (today vs prior run) for the
+                          weather forecast — only populated at
+                          inference time. NaN at train time; the
+                          median imputer fills, the walk-forward
+                          selector prunes the channels that don't add
+                          signal.
 
 All features are leakage-safe: they use information available BEFORE
 the prediction date's 5pm settle.
@@ -94,16 +104,19 @@ def build_features(panel: pd.DataFrame,
 
 def build_today_row(panel: pd.DataFrame, forecast_row: pd.Series,
                     cross_kalshi_features: pd.Series = None,
+                    forecast_revisions: pd.Series = None,
                     target: str = "natgas_henry_hub_usd_mmbtu"
                     ) -> pd.DataFrame:
     """Build a single-row feature DataFrame for prediction.
 
     `panel` is the historical daily panel up to (but not including)
     today. `forecast_row` is a Series with the columns produced by
-    `fetch_weather_forecast` (national HDD/CDD anomalies). Optional
+    `fetch_weather_forecast` (national + regional + LNG-terminal
+    weather, wind/humidity, storm flags). Optional
     `cross_kalshi_features` is the snapshot from
     `fetch_cross_kalshi_features` — these are appended as columns on
-    the today-row.
+    the today-row. Optional `forecast_revisions` is the day-over-day
+    weather-forecast delta from `compute_forecast_revisions`.
 
     Returns a 1-row DataFrame with the same columns as `build_features`
     output, ready for `model.predict()`.
@@ -134,6 +147,14 @@ def build_today_row(panel: pd.DataFrame, forecast_row: pd.Series,
     if cross_kalshi_features is not None and not cross_kalshi_features.empty:
         for k, v in cross_kalshi_features.items():
             today_features[k] = v
+    # Forecast-revision deltas — also snapshot-only. NaN at train time
+    # (we don't have a historical record of yesterday's forecast), so
+    # the imputer fills and the walk-forward selector prunes. As we
+    # accumulate a forecast-history archive we can backfill these at
+    # training time too.
+    if forecast_revisions is not None and not forecast_revisions.empty:
+        for k, v in forecast_revisions.items():
+            today_features[k] = v
     return today_features
 
 
@@ -142,9 +163,19 @@ def build_today_row(panel: pd.DataFrame, forecast_row: pd.Series,
 # --------------------------------------------------------------------------- #
 
 def _add_weather_features(out: pd.DataFrame) -> None:
-    """HDD/CDD lags + rolling averages — the strongest weather drivers
-    for NG demand. Anomalies (deviation from rolling normal) capture
-    sudden cold snaps / heat waves which are what move NG price."""
+    """National + regional HDD/CDD lags, rolling averages, wave-duration
+    counters, wind/humidity, LNG-terminal weather, and Gulf storm flag
+    — the full weather stack for NG-demand and supply-disruption signals.
+
+    Anomalies (deviation from rolling normal) capture sudden cold snaps
+    / heat waves which is what moves NG price. Wave-duration counters
+    flag *persistent* events — a 3-day cold spell prices very differently
+    from a 1-day blip because storage gets drawn measurably. LNG-terminal
+    wind + storm flags capture export-demand disruption; Gulf storm flag
+    captures production-side disruption. Wind in general matters for
+    renewable/wind-power offset, which displaces NG burn for power.
+    """
+    # ── National HDD ────────────────────────────────────────────────
     if "national_hdd" in out.columns:
         for lag in (1, 2, 3, 7, 14):
             out[f"hdd_lag_{lag}"] = out["national_hdd"].shift(lag)
@@ -152,6 +183,15 @@ def _add_weather_features(out: pd.DataFrame) -> None:
                                 .shift(1).rolling(7, min_periods=3).mean())
         out["hdd_rolling_30"] = (out["national_hdd"]
                                   .shift(1).rolling(30, min_periods=10).mean())
+        # Cold-wave duration: consecutive prior days with HDD > 25 (a
+        # noticeably cold day). Streak resets on any below-threshold day.
+        out["cold_wave_days"] = _streak_above(
+            out["national_hdd"].shift(1), threshold=25.0)
+        # Sum of HDD over the last 3 days — captures sustained cold.
+        out["hdd_sum_3d"] = (out["national_hdd"]
+                              .shift(1).rolling(3, min_periods=2).sum())
+
+    # ── National CDD ────────────────────────────────────────────────
     if "national_cdd" in out.columns:
         for lag in (1, 2, 3, 7, 14):
             out[f"cdd_lag_{lag}"] = out["national_cdd"].shift(lag)
@@ -159,9 +199,83 @@ def _add_weather_features(out: pd.DataFrame) -> None:
                                 .shift(1).rolling(7, min_periods=3).mean())
         out["cdd_rolling_30"] = (out["national_cdd"]
                                   .shift(1).rolling(30, min_periods=10).mean())
+        out["heat_wave_days"] = _streak_above(
+            out["national_cdd"].shift(1), threshold=15.0)
+        out["cdd_sum_3d"] = (out["national_cdd"]
+                              .shift(1).rolling(3, min_periods=2).sum())
+
     if "national_avg_temp_f" in out.columns:
         for lag in (1, 7):
             out[f"temp_lag_{lag}"] = out["national_avg_temp_f"].shift(lag)
+
+    # ── Wind + humidity (national, power-burn substitution signal) ──
+    if "national_wind_mph" in out.columns:
+        for lag in (1, 2, 7):
+            out[f"wind_lag_{lag}"] = out["national_wind_mph"].shift(lag)
+        out["wind_rolling_7"] = (out["national_wind_mph"]
+                                  .shift(1).rolling(7, min_periods=3).mean())
+    if "national_humidity_pct" in out.columns:
+        for lag in (1, 7):
+            out[f"humidity_lag_{lag}"] = (
+                out["national_humidity_pct"].shift(lag))
+
+    # ── Regional HDD/CDD — per-region demand decomposition.
+    # NG demand is dominated by Northeast + Midwest in winter (heating)
+    # and South in summer (power-burn for AC). Letting the model see
+    # the regional breakdown rather than only the national aggregate
+    # gives it a sharper read on where in the demand stack a given
+    # weather print sits.
+    region_cols = [c for c in out.columns if c.startswith("region_")]
+    for col in region_cols:
+        for lag in (1, 7):
+            out[f"{col}_lag_{lag}"] = out[col].shift(lag)
+        if col.endswith("_hdd") or col.endswith("_cdd"):
+            out[f"{col}_rolling_7"] = (out[col]
+                                        .shift(1).rolling(7, min_periods=3).mean())
+
+    # ── LNG-terminal weather (export-side disruption) ───────────────
+    if "lng_terminal_wind_mph" in out.columns:
+        out["lng_wind_lag_1"] = out["lng_terminal_wind_mph"].shift(1)
+        out["lng_wind_rolling_3"] = (out["lng_terminal_wind_mph"]
+                                      .shift(1).rolling(3, min_periods=1).mean())
+    if "lng_terminal_storm_flag" in out.columns:
+        out["lng_storm_lag_1"] = out["lng_terminal_storm_flag"].shift(1)
+        # 7-day storm-disruption count — a single-day storm vs a multi-
+        # day system disrupts very differently. Sums the prior 7 days
+        # of binary storm flags.
+        out["lng_storm_count_7d"] = (out["lng_terminal_storm_flag"]
+                                      .shift(1)
+                                      .rolling(7, min_periods=1).sum())
+    if "lng_terminal_avg_temp_f" in out.columns:
+        out["lng_temp_lag_1"] = out["lng_terminal_avg_temp_f"].shift(1)
+
+    # ── Gulf hurricane / storm disruption ────────────────────────────
+    # Tropical-storm-force winds in the Gulf hit ~17% of US dry-gas
+    # production from offshore + onshore Louisiana / Texas. Plumb in
+    # both the active flag (binary) and a rolling 7-day count (proxy
+    # for "we're in storm season AND a system has been active recently").
+    if "gulf_storm_active" in out.columns:
+        out["gulf_storm_lag_1"] = out["gulf_storm_active"].shift(1)
+        out["gulf_storm_count_7d"] = (out["gulf_storm_active"]
+                                       .shift(1)
+                                       .rolling(7, min_periods=1).sum())
+    if "gulf_max_wind_mph" in out.columns:
+        out["gulf_wind_lag_1"] = out["gulf_max_wind_mph"].shift(1)
+        out["gulf_wind_rolling_3"] = (out["gulf_max_wind_mph"]
+                                       .shift(1).rolling(3, min_periods=1).mean())
+
+
+def _streak_above(series: pd.Series, threshold: float) -> pd.Series:
+    """Count consecutive elements > threshold ending at each position.
+    Resets to 0 on any below-threshold value. Pre-shift the series if
+    you want a leakage-safe view (this function does no shifting).
+    """
+    flag = (series > threshold).astype(float)
+    # Standard cumcount-within-groups trick: cumsum of inverse marks
+    # the streak ID; counting within each ID gives the streak length.
+    group = (flag != flag.shift(1)).cumsum()
+    streak = flag.groupby(group).cumsum() * flag
+    return streak.astype(float)
 
 
 def _add_storage_features(out: pd.DataFrame) -> None:

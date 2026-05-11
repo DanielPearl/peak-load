@@ -34,8 +34,11 @@ import pandas as pd
 from src.config import Config, load_config
 from src.data_loaders import (
     build_panel,
+    compute_forecast_revisions,
     fetch_cross_kalshi_features,
     fetch_weather_forecast,
+    load_previous_forecast,
+    save_current_forecast,
 )
 from src.features import build_today_row
 from src.kalshi import fetch_kalshi_markets, fetch_market_status
@@ -83,8 +86,25 @@ def main() -> int:
         log.info("cross-Kalshi features: %d channels populated",
                  cross_kalshi.notna().sum())
 
+    # Forecast-revision snapshot: load yesterday's saved forecast (if
+    # any) and compute day-over-day weather deltas. First run after a
+    # deploy produces NaN deltas (no prior); the median imputer fills.
+    forecast_history_path = (cfg.daily_csv_path.parent.parent
+                              / "data" / "last_forecast.json")
+    previous_forecast = load_previous_forecast(forecast_history_path)
+    revisions = compute_forecast_revisions(today_forecast, previous_forecast)
+    if previous_forecast is not None:
+        n_rev = int(revisions.notna().sum())
+        log.info("forecast revisions: %d channels with day-over-day delta",
+                 n_rev)
+    else:
+        log.info("forecast revisions: no prior snapshot — first run")
+    # Persist today's forecast so tomorrow's run has a baseline.
+    save_current_forecast(forecast_history_path, today_forecast)
+
     feature_row = build_today_row(panel, today_forecast,
                                    cross_kalshi_features=cross_kalshi,
+                                   forecast_revisions=revisions,
                                    target=cfg.target_column)
     forecast_usd = float(model.predict(feature_row)[0])
     log.info("today's NG forecast: $%.3f / MMBTU", forecast_usd)
@@ -282,6 +302,7 @@ def _validator_cfg(cfg: Config) -> ValidatorCfg:
         max_spread_cents=cfg.val_max_spread_cents,
         prob_bounds_cents=(cfg.val_prob_bounds_cents_low,
                             cfg.val_prob_bounds_cents_high),
+        max_entry_price_cents=cfg.val_max_entry_price_cents,
         min_minutes_to_close=cfg.val_min_minutes_to_close,
         max_minutes_to_close=cfg.val_max_minutes_to_close,
         basis_risk_strike_window=cfg.val_basis_risk_strike_window_usd,
