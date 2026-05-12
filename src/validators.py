@@ -27,6 +27,10 @@ class ValidatorCfg:
     # Price-band gate. Skip deep-in / deep-out tail markets where
     # asymmetric payoffs make the edge fragile.
     prob_bounds_cents: Tuple[int, int] = (5, 95)
+    # Hard cap on what we'll pay for the SIDE we'd actually buy. At >75c
+    # the loss-vs-gain ratio is 3:1+ and a single missed call eats many
+    # wins. Variance protection independent of edge math. 100 disables.
+    max_entry_price_cents: int = 75
     # Time gate. Daily NG markets close at 5pm EDT, so minimum gives
     # breathing room against minute-to-settlement noise.
     min_minutes_to_close: int = 30

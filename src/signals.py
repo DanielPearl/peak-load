@@ -89,10 +89,28 @@ def compute_signal(cfg: Config, market: KalshiMarket,
 
     # Edge gate. Symmetric: positive edge (model thinks more likely
     # than market) → BUY YES; negative edge → BUY NO.
+    max_entry = getattr(cfg, "val_max_entry_price_cents", 100)
     if edge >= cfg.min_edge:
+        # Variance gate: refuse to pay more than max_entry for YES.
+        if (market.yes_ask_cents is not None
+                and market.yes_ask_cents > max_entry):
+            return _no_trade(
+                market, model_p, kalshi_p,
+                (f"entry_too_expensive_yes "
+                 f"({market.yes_ask_cents}c>{max_entry}c)"),
+                edge=edge, spread=spread,
+            )
         return _trade(market, model_p, kalshi_p, edge, spread,
                       decision="BUY_YES", reason=f"edge_yes={edge:+.3f}")
     if edge <= -cfg.min_edge:
+        if (market.no_ask_cents is not None
+                and market.no_ask_cents > max_entry):
+            return _no_trade(
+                market, model_p, kalshi_p,
+                (f"entry_too_expensive_no "
+                 f"({market.no_ask_cents}c>{max_entry}c)"),
+                edge=edge, spread=spread,
+            )
         return _trade(market, model_p, kalshi_p, edge, spread,
                       decision="BUY_NO", reason=f"edge_no={edge:+.3f}")
     return _no_trade(market, model_p, kalshi_p,

@@ -1,7 +1,10 @@
-requests>=2.32
-python-dotenv>=1.0
+# kalshi-sdk pulls in: requests, cryptography, python-dotenv, websocket-client.
+# Install with: pip install -e ../kalshi_sdk  (run from this dir)
+-e ../kalshi_sdk
+
+# Bot-specific:
+PyYAML>=6.0
 pandas>=2.2
 numpy>=1.26
 scipy>=1.11
 scikit-learn==1.6.1
-cryptography>=42.0
