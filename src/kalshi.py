@@ -87,6 +87,69 @@ def fetch_market_status(cfg: Config, ticker: str) -> Optional[dict]:
         return None
 
 
+def fetch_kalshi_implied_spot(cfg: Config,
+                                markets: Optional[List[KalshiMarket]] = None,
+                                ) -> Optional[float]:
+    """Estimate today's Henry Hub spot from the live KXNATGASD market.
+
+    For an "above $X" market priced at YES = 50¢ the market is saying
+    "50/50 the spot is above X" — i.e. spot ≈ X. So we sort the open
+    KXNATGASD markets by strike and linearly interpolate the strike
+    where the YES ask crosses 50¢.
+
+    Why this matters: the bot's primary price input is EIA's
+    ``NG.RNGWHHD.D`` series which publishes with a 2-3 day lag. When
+    the model retrains or scores, its lag-1 price feature is anchored
+    to that stale EIA value, and the forecast comes out anchored to
+    the same stale level. Kalshi prices update intra-day on the same
+    series the bot trades against, so they're the most timely public
+    source of "what does the market think spot is RIGHT NOW".
+
+    Returns ``None`` when the spot can't be inferred (no creds, no
+    markets returned, no 50¢ crossover in the visible strike range).
+    Callers should fall back to the panel's most recent EIA value
+    in that case.
+    """
+    if markets is None:
+        markets = fetch_kalshi_markets(cfg)
+    if not markets:
+        return None
+    # Collect (strike, yes_ask_cents) for every priced "above $X"
+    # market on today's event. Each event's strikes form a clean
+    # monotone curve (yes_ask falls as strike rises), so we can
+    # linearly interpolate the 50¢ crossover.
+    today_strikes = sorted(
+        ((m.threshold_value, m.yes_ask_cents) for m in markets
+         if m.threshold_value is not None and m.yes_ask_cents is not None),
+        key=lambda x: x[0],
+    )
+    if len(today_strikes) < 2:
+        return None
+    # Find the adjacent pair that brackets 50¢.
+    for (lo_strike, lo_yes), (hi_strike, hi_yes) in zip(
+            today_strikes, today_strikes[1:]):
+        # yes_ask is monotone DECREASING with strike (higher bar to
+        # clear -> lower YES). The crossover happens between two
+        # strikes whose YES asks straddle 50¢.
+        if lo_yes >= 50 >= hi_yes:
+            # Linear interp on yes_ask vs strike.
+            span = lo_yes - hi_yes
+            if span <= 0:
+                return float(lo_strike)
+            frac = (lo_yes - 50) / span
+            return float(lo_strike + frac * (hi_strike - lo_strike))
+    # If 50¢ falls outside the strike range, anchor to the closer
+    # endpoint rather than returning None — keeps the bot's
+    # subsequent fallback path simpler.
+    lo_strike, lo_yes = today_strikes[0]
+    hi_strike, hi_yes = today_strikes[-1]
+    if lo_yes < 50:
+        return float(lo_strike)
+    if hi_yes > 50:
+        return float(hi_strike)
+    return None
+
+
 class _SignedClient:
     """Back-compat shim. Old call sites used ``_SignedClient(cfg).get(path, params)``.
 

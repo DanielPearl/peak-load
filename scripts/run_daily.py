@@ -71,6 +71,59 @@ def main() -> int:
 
     # ── 1. Today's feature row ────────────────────────────────────────
     panel = build_panel(cfg, days=cfg.history_days_for_training)
+
+    # EIA's Henry Hub series publishes with a 2-3 day lag, so the
+    # tail of ``panel`` is typically a few days stale. The bot's
+    # downstream lag-1 price feature would otherwise anchor today's
+    # forecast to that stale value, producing forecasts that lag
+    # reality by several days. Patch it by injecting today's
+    # Kalshi-implied spot (the 50¢-crossover strike on the live
+    # KXNATGASD event) as a yesterday-dated price row, so the
+    # build_today_row's lag-1 feature picks it up.
+    from src.kalshi import fetch_kalshi_implied_spot
+    try:
+        implied = fetch_kalshi_implied_spot(cfg)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Kalshi-implied spot fetch failed (%s); falling back "
+                     "to stale EIA tail", exc)
+        implied = None
+    if implied is not None:
+        # Sanity bounds — Henry Hub spot has ranged $1.50-$10 in the
+        # last decade; anything outside is almost certainly a parse
+        # error and we shouldn't let it poison the panel.
+        if 1.0 <= implied <= 12.0:
+            yesterday = (pd.Timestamp.utcnow().normalize()
+                         .tz_localize(None) - pd.Timedelta(days=1))
+            stale_tail_value = (
+                panel["natgas_henry_hub_usd_mmbtu"].dropna().iloc[-1]
+                if "natgas_henry_hub_usd_mmbtu" in panel.columns
+                and not panel["natgas_henry_hub_usd_mmbtu"].dropna().empty
+                else None
+            )
+            # Build a yesterday-dated row with just the price column
+            # filled. Weather/storage/etc. columns stay NaN — the
+            # imputer handles them, and the lag-1 PRICE is what we
+            # care about pulling forward.
+            new_row = pd.Series(
+                {"natgas_henry_hub_usd_mmbtu": float(implied)},
+                name=yesterday,
+            )
+            # Overwrite or insert — pandas handles both via .loc.
+            panel.loc[yesterday, "natgas_henry_hub_usd_mmbtu"] = float(implied)
+            panel = panel.sort_index()
+            log.info(
+                "patched panel lag-1 with Kalshi-implied spot: $%.3f / MMBTU "
+                "(stale EIA tail was $%.3f)",
+                implied,
+                (float(stale_tail_value) if stale_tail_value is not None
+                 else float("nan")),
+            )
+        else:
+            log.warning("Kalshi-implied spot $%.3f outside sanity bounds — "
+                         "skipping panel patch", implied)
+    else:
+        log.info("Kalshi-implied spot unavailable — using EIA tail as-is")
+
     forecast = fetch_weather_forecast(cfg, days_ahead=2)
     if forecast.empty:
         log.error("weather forecast unavailable — cannot build today's row")
