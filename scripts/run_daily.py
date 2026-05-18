@@ -72,14 +72,28 @@ def main() -> int:
     # ── 1. Today's feature row ────────────────────────────────────────
     panel = build_panel(cfg, days=cfg.history_days_for_training)
 
-    # EIA's Henry Hub series publishes with a 2-3 day lag, so the
-    # tail of ``panel`` is typically a few days stale. The bot's
-    # downstream lag-1 price feature would otherwise anchor today's
-    # forecast to that stale value, producing forecasts that lag
-    # reality by several days. Patch it by injecting today's
-    # Kalshi-implied spot (the 50¢-crossover strike on the live
-    # KXNATGASD event) as a yesterday-dated price row, so the
-    # build_today_row's lag-1 feature picks it up.
+    forecast = fetch_weather_forecast(cfg, days_ahead=2)
+    if forecast.empty:
+        log.error("weather forecast unavailable — cannot build today's row")
+        return 1
+    today_forecast = forecast.iloc[0]
+    forecast_date = pd.Timestamp(today_forecast.name).normalize()
+
+    # EIA's Henry Hub series publishes with a 2-3 day lag, so the panel
+    # tail is several days stale. ``fetch_weather_forecast`` returns
+    # future-only days, so ``forecast_date`` is typically tomorrow UTC —
+    # meaning the model's lag-1 price feature looks at TODAY UTC, not
+    # yesterday. Without this patch, lag-1 is NaN and the imputer
+    # median-fills, producing a forecast anchored on historical median
+    # instead of current price.
+    #
+    # Patch: forward-fill the gap from the last EIA print through the
+    # anchor date with the Kalshi-implied spot (the 50¢-crossover strike
+    # on the live KXNATGASD event), then overlay the anchor with that
+    # same value. The forward-fill keeps target_rolling_7 / roc_7 /
+    # trend_dev_* non-NaN; the anchor overwrites lag-1 with the most
+    # recent market-implied print.
+    ng_col = "natgas_henry_hub_usd_mmbtu"
     from src.kalshi import fetch_kalshi_implied_spot
     try:
         implied = fetch_kalshi_implied_spot(cfg)
@@ -87,48 +101,33 @@ def main() -> int:
         log.warning("Kalshi-implied spot fetch failed (%s); falling back "
                      "to stale EIA tail", exc)
         implied = None
-    if implied is not None:
-        # Sanity bounds — Henry Hub spot has ranged $1.50-$10 in the
-        # last decade; anything outside is almost certainly a parse
-        # error and we shouldn't let it poison the panel.
-        if 1.0 <= implied <= 12.0:
-            yesterday = (pd.Timestamp.utcnow().normalize()
-                         .tz_localize(None) - pd.Timedelta(days=1))
-            stale_tail_value = (
-                panel["natgas_henry_hub_usd_mmbtu"].dropna().iloc[-1]
-                if "natgas_henry_hub_usd_mmbtu" in panel.columns
-                and not panel["natgas_henry_hub_usd_mmbtu"].dropna().empty
-                else None
-            )
-            # Build a yesterday-dated row with just the price column
-            # filled. Weather/storage/etc. columns stay NaN — the
-            # imputer handles them, and the lag-1 PRICE is what we
-            # care about pulling forward.
-            new_row = pd.Series(
-                {"natgas_henry_hub_usd_mmbtu": float(implied)},
-                name=yesterday,
-            )
-            # Overwrite or insert — pandas handles both via .loc.
-            panel.loc[yesterday, "natgas_henry_hub_usd_mmbtu"] = float(implied)
-            panel = panel.sort_index()
-            log.info(
-                "patched panel lag-1 with Kalshi-implied spot: $%.3f / MMBTU "
-                "(stale EIA tail was $%.3f)",
-                implied,
-                (float(stale_tail_value) if stale_tail_value is not None
-                 else float("nan")),
-            )
-        else:
-            log.warning("Kalshi-implied spot $%.3f outside sanity bounds — "
-                         "skipping panel patch", implied)
+    if implied is not None and 1.0 <= implied <= 12.0:
+        anchor_date = forecast_date - pd.Timedelta(days=1)
+        last_eia_idx = (panel[ng_col].dropna().index.max()
+                         if ng_col in panel.columns
+                         and not panel[ng_col].dropna().empty else None)
+        stale_tail_value = (float(panel.loc[last_eia_idx, ng_col])
+                             if last_eia_idx is not None else None)
+        if last_eia_idx is not None and last_eia_idx < anchor_date:
+            gap_dates = pd.date_range(last_eia_idx + pd.Timedelta(days=1),
+                                       anchor_date - pd.Timedelta(days=1),
+                                       freq="D")
+            for d in gap_dates:
+                panel.loc[d, ng_col] = stale_tail_value
+        panel.loc[anchor_date, ng_col] = float(implied)
+        panel = panel.sort_index()
+        log.info(
+            "patched panel lag-1 with Kalshi-implied spot: $%.3f / MMBTU "
+            "at %s (last EIA print: $%s)",
+            implied, anchor_date.date(),
+            (f"{stale_tail_value:.3f}" if stale_tail_value is not None
+             else "n/a"),
+        )
+    elif implied is not None:
+        log.warning("Kalshi-implied spot $%.3f outside sanity bounds — "
+                     "skipping panel patch", implied)
     else:
         log.info("Kalshi-implied spot unavailable — using EIA tail as-is")
-
-    forecast = fetch_weather_forecast(cfg, days_ahead=2)
-    if forecast.empty:
-        log.error("weather forecast unavailable — cannot build today's row")
-        return 1
-    today_forecast = forecast.iloc[0]
 
     # Cross-Kalshi feature snapshot: pull current implied probabilities
     # from related markets (crude oil, war/conflict, hurricane, fed
