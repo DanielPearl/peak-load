@@ -247,6 +247,9 @@ def main() -> int:
         recall=model.metrics.get("per_strike_avg_recall", 0.0),
         f1=model.metrics.get("per_strike_avg_f1", 0.0),
         roc_auc=model.metrics.get("per_strike_avg_roc_auc", 0.0),
+        brier=model.metrics.get("per_strike_avg_brier"),
+        rows_train=model.metrics.get("n_train"),
+        rows_test=model.metrics.get("n_test"),
     )
     for s in signals:
         sim.record_market_view(

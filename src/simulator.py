@@ -338,6 +338,9 @@ class NatGasSimulator:
         classifier_accuracy: float = 0.0,
         precision: float = 0.0, recall: float = 0.0,
         f1: float = 0.0, roc_auc: float = 0.0,
+        brier: float | None = None,
+        rows_train: int | None = None,
+        rows_test: int | None = None,
     ) -> None:
         """One row per daily run, populated for the dashboard's Model
         section. The classification metrics (acc/prec/recall/F1/AUC)
@@ -346,20 +349,30 @@ class NatGasSimulator:
         """
         now = datetime.now(timezone.utc).isoformat()
         with closing(self._conn()) as c, c:
+            for col_def in (
+                "training_brier REAL",
+                "rows_train INTEGER",
+                "rows_test INTEGER",
+            ):
+                try:
+                    c.execute(f"ALTER TABLE model_snapshots ADD COLUMN {col_def}")
+                except sqlite3.OperationalError:
+                    pass
             c.execute(
                 "INSERT INTO model_snapshots("
                 "  captured_at, current_gas_price, median_change, median_price,"
                 "  prob_up, quantile_05, quantile_50, quantile_95,"
                 "  residual_std, feature_count, classifier_accuracy,"
                 "  training_precision, training_recall, training_f1, "
-                "  training_roc_auc"
-                ") VALUES (?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "  training_roc_auc, training_brier, rows_train, rows_test"
+                ") VALUES (?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (now, forecast_value, forecast_value, median_threshold_prob,
                  forecast_value - 1.645 * residual_std,
                  forecast_value,
                  forecast_value + 1.645 * residual_std,
                  residual_std, n_features,
-                 classifier_accuracy, precision, recall, f1, roc_auc),
+                 classifier_accuracy, precision, recall, f1, roc_auc,
+                 brier, rows_train, rows_test),
             )
 
     def record_market_view(

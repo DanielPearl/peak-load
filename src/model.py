@@ -48,6 +48,7 @@ from sklearn.inspection import permutation_importance
 from sklearn.linear_model import ElasticNetCV
 from sklearn.metrics import (
     accuracy_score,
+    brier_score_loss,
     f1_score,
     mean_absolute_error,
     mean_squared_error,
@@ -557,6 +558,7 @@ def train_model(
                     recall_score(y_thr_test, test_pred, zero_division=0)),
                 "test_f1": float(f1_score(y_thr_test, test_pred, zero_division=0)),
                 "test_roc_auc": float(roc_auc_score(y_thr_test, test_probs)),
+                "test_brier": float(brier_score_loss(y_thr_test, test_probs)),
             }
     if threshold_classifiers:
         thr_lo = min(threshold_classifiers)
@@ -588,8 +590,9 @@ def train_model(
         avg_rec = float(np.mean([m["test_recall"] for m in threshold_metrics.values()]))
         avg_f1 = float(np.mean([m["test_f1"] for m in threshold_metrics.values()]))
         avg_auc = float(np.mean([m["test_roc_auc"] for m in threshold_metrics.values()]))
+        avg_brier = float(np.mean([m["test_brier"] for m in threshold_metrics.values()]))
     else:
-        avg_acc = avg_prec = avg_rec = avg_f1 = avg_auc = 0.0
+        avg_acc = avg_prec = avg_rec = avg_f1 = avg_auc = avg_brier = 0.0
 
     metrics = {
         # Point-forecast diagnostics (the dashboard reads these).
@@ -604,8 +607,11 @@ def train_model(
         "per_strike_avg_recall": avg_rec,
         "per_strike_avg_f1": avg_f1,
         "per_strike_avg_roc_auc": avg_auc,
+        "per_strike_avg_brier": avg_brier,
         "per_strike_count": len(threshold_classifiers),
         "n_features_selected": len(feature_columns),
+        "n_train": int(len(X_train)),
+        "n_test": int(len(X_test)),
     }
     log.info("test-set headline — MAE=$%.3f/MMBTU  R2=%.3f  | per-strike avg: "
              "acc=%.3f prec=%.3f rec=%.3f F1=%.3f AUC=%.3f over %d thresholds",
