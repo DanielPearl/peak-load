@@ -185,6 +185,17 @@ class NatGasSimulator:
         """
         if self.has_open_position(ticker):
             return False, "already_have_open_position"
+        # One-shot-per-ticker — refuse re-entry once a position on this
+        # exact ticker has closed. Same Kalshi strike on a different
+        # date is a different ticker so daily strike-following still
+        # works.
+        with closing(self._conn()) as c:
+            any_closed = c.execute(
+                "SELECT 1 FROM positions WHERE ticker = ? AND status = 'closed' LIMIT 1",
+                (ticker,),
+            ).fetchone()
+        if any_closed is not None:
+            return False, "already_traded_this_ticker"
         if len(self.open_positions()) >= self.cfg.max_open_positions:
             return False, f"max_open_positions ({self.cfg.max_open_positions})"
         cost = ask_cents   # 1 contract per bet
