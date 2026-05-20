@@ -267,15 +267,270 @@ def fetch_national_weather(cfg: Config, days: int = 1095) -> pd.DataFrame:
     return _synthetic_national_weather(cfg, days=days)
 
 
-def _fetch_noaa_national_real(cfg: Config, days: int) -> pd.DataFrame:
-    """NOAA real fetch — currently a stub.
+NOAA_CDO_BASE = "https://www.ncei.noaa.gov/cdo-web/api/v2"
+NOAA_WEATHER_CACHE = "data/noaa_national_weather.pkl"
 
-    Production wiring: GHCND daily endpoint per station, fetch TAVG (or
-    compute from TMAX/TMIN if TAVG missing), pivot, weight-average.
-    Rate-limited to 5 reqs/sec, 10K rows/req — paginate by year.
+
+def _fetch_noaa_station_year(token: str, station_id: str,
+                              year: int) -> pd.DataFrame:
+    """One GHCND station × one calendar year of daily TAVG/TMAX/TMIN.
+
+    NOAA caps responses at 1000 rows and 1-year windows. Returns a
+    DataFrame indexed by date with columns ``TAVG``, ``TMAX``, ``TMIN``
+    in °F. Missing metric → NaN column.
     """
-    raise NotImplementedError(
-        "NOAA national weather fetch is a stub — wire when needed.")
+    out_rows: dict = {}  # date -> {metric: value}
+    offset = 1
+    while True:
+        params = {
+            "datasetid": "GHCND",
+            "stationid": station_id,
+            "startdate": f"{year}-01-01",
+            "enddate": f"{year}-12-31",
+            "datatypeid": ["TAVG", "TMAX", "TMIN"],
+            "units": "standard",
+            "limit": 1000,
+            "offset": offset,
+        }
+        r = requests.get(
+            f"{NOAA_CDO_BASE}/data",
+            params=params,
+            headers={"token": token},
+            timeout=30,
+        )
+        if r.status_code == 429:
+            # NOAA rate limit (5/sec, 1000/day). Back off and retry once.
+            import time as _t
+            _t.sleep(2.0)
+            r = requests.get(
+                f"{NOAA_CDO_BASE}/data",
+                params=params,
+                headers={"token": token},
+                timeout=30,
+            )
+        r.raise_for_status()
+        rows = r.json().get("results", []) or []
+        if not rows:
+            break
+        for row in rows:
+            date_str = (row.get("date") or "")[:10]
+            metric = row.get("datatype")
+            value = row.get("value")
+            if not date_str or metric not in ("TAVG", "TMAX", "TMIN"):
+                continue
+            out_rows.setdefault(date_str, {})[metric] = float(value)
+        if len(rows) < 1000:
+            break
+        offset += 1000
+    if not out_rows:
+        return pd.DataFrame(columns=["TAVG", "TMAX", "TMIN"])
+    df = pd.DataFrame.from_dict(out_rows, orient="index")
+    df.index = pd.to_datetime(df.index)
+    df = df.sort_index()
+    for col in ("TAVG", "TMAX", "TMIN"):
+        if col not in df.columns:
+            df[col] = float("nan")
+    return df[["TAVG", "TMAX", "TMIN"]]
+
+
+def _fetch_noaa_national_real(cfg: Config, days: int) -> pd.DataFrame:
+    """Pull GHCND daily temps for every reference station and build a
+    weight-averaged national + per-region HDD/CDD panel.
+
+    Uses an on-disk cache of the merged DataFrame so subsequent retrains
+    only have to fetch the trailing window since the last cached date.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from pathlib import Path
+
+    token = cfg.noaa_token
+    if not token:
+        raise RuntimeError("NOAA_TOKEN not set")
+
+    stations = [s for s in cfg.weather_reference_stations if s.get("noaa_id")]
+    if not stations:
+        raise RuntimeError("no weather_reference_stations have noaa_id")
+
+    end_date = datetime.now(timezone.utc).date()
+    earliest_needed = end_date - timedelta(days=days)
+
+    cache_path = Path(NOAA_WEATHER_CACHE)
+    cached: Optional[pd.DataFrame] = None
+    if cache_path.exists():
+        try:
+            cached = pd.read_pickle(cache_path)
+            log.info("NOAA cache: %d rows %s → %s", len(cached),
+                     cached.index.min().date(), cached.index.max().date())
+        except Exception as exc:  # noqa: BLE001
+            log.warning("NOAA cache load failed: %s", exc)
+
+    # Decide which years to fetch:
+    #   - If cache missing, fetch from earliest_needed.year onward
+    #   - If cache exists and covers earliest_needed, only fetch the
+    #     current year (catches any new days since last cache write)
+    #   - If cache starts after earliest_needed (e.g. days increased),
+    #     fetch backwards from cache.min.year - 1 to earliest_needed
+    years_to_fetch: list = []
+    if cached is None:
+        years_to_fetch = list(range(earliest_needed.year, end_date.year + 1))
+    else:
+        cached_min_year = cached.index.min().year
+        cached_max_year = cached.index.max().year
+        # Backfill if user expanded the window
+        if earliest_needed.year < cached_min_year:
+            years_to_fetch.extend(
+                range(earliest_needed.year, cached_min_year))
+        # Always refresh current + previous year (NOAA backfills slowly)
+        years_to_fetch.append(cached_max_year - 1)
+        years_to_fetch.append(cached_max_year)
+        years_to_fetch.append(end_date.year)
+        years_to_fetch = sorted(set(years_to_fetch))
+
+    log.info("NOAA fetching %d stations × %d years",
+             len(stations), len(years_to_fetch))
+
+    def _fetch_one(station: dict, year: int):
+        try:
+            df = _fetch_noaa_station_year(token, station["noaa_id"], year)
+            return station, year, df, None
+        except Exception as exc:  # noqa: BLE001
+            return station, year, None, exc
+
+    rows_by_station: dict = {s["name"]: [] for s in stations}
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        futures = [
+            ex.submit(_fetch_one, st, yr)
+            for st in stations for yr in years_to_fetch
+        ]
+        for fut in as_completed(futures):
+            st, yr, df, exc = fut.result()
+            if exc is not None or df is None:
+                log.warning("NOAA %s %d failed: %s", st["name"], yr, exc)
+                continue
+            rows_by_station[st["name"]].append(df)
+
+    # Per-station: stack the year DataFrames, fall back to (TMAX+TMIN)/2
+    # when TAVG is missing for a day.
+    station_series: dict = {}
+    for st in stations:
+        parts = rows_by_station[st["name"]]
+        if not parts:
+            continue
+        merged = pd.concat(parts).sort_index()
+        merged = merged[~merged.index.duplicated(keep="last")]
+        tavg = merged["TAVG"]
+        # Backfill missing TAVG from TMAX/TMIN midpoint.
+        tmid = (merged["TMAX"] + merged["TMIN"]) / 2.0
+        tavg = tavg.where(tavg.notna(), tmid)
+        station_series[st["name"]] = tavg.rename(st["name"])
+
+    if not station_series:
+        raise RuntimeError("NOAA returned no usable station data")
+
+    # Wide DataFrame: one column per station, indexed by date.
+    fresh = pd.concat(station_series.values(), axis=1).sort_index()
+    fresh.index = fresh.index.normalize()
+
+    # Merge with cache (cache wins for historical, fresh wins for new).
+    if cached is not None:
+        # Cache stored the wide station panel (same shape).
+        combined = pd.concat([cached, fresh])
+        combined = combined[~combined.index.duplicated(keep="last")]
+        combined = combined.sort_index()
+    else:
+        combined = fresh
+
+    try:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        combined.to_pickle(cache_path)
+    except Exception as exc:  # noqa: BLE001
+        log.debug("NOAA cache write failed: %s", exc)
+
+    # Build the national + regional aggregates.
+    return _build_weather_aggregates(cfg, combined)
+
+
+def _build_weather_aggregates(cfg: Config,
+                                station_temps: pd.DataFrame) -> pd.DataFrame:
+    """Turn a per-station daily temp panel into the national + per-region
+    HDD/CDD frame the downstream feature engineering expects.
+
+    Wind / humidity / storm-flag columns are emitted as NaN — NOAA's
+    GHCND endpoint doesn't reliably serve them per station. The median
+    imputer will fill them at training time; the walk-forward selector
+    will drop them if they aren't carrying signal.
+    """
+    name_to_meta = {s["name"]: s for s in cfg.weather_reference_stations
+                    if s["name"] in station_temps.columns}
+    if not name_to_meta:
+        raise RuntimeError("station temps panel has no recognised stations")
+
+    # National weighted-average temp.
+    weights = pd.Series({n: m.get("weight", 0.0)
+                         for n, m in name_to_meta.items()})
+    total_w = weights.sum() or 1.0
+    weights = weights / total_w
+
+    df = station_temps[list(name_to_meta)].copy()
+    # Each day: weighted sum across available stations only (renormalize
+    # weights when a station is missing for that day).
+    available_mask = df.notna()
+    weighted_vals = df.fillna(0.0) * weights
+    row_w = available_mask.astype(float) * weights
+    row_w_sum = row_w.sum(axis=1).replace(0.0, float("nan"))
+    national_temp = weighted_vals.sum(axis=1) / row_w_sum
+
+    national_hdd = (65.0 - national_temp).clip(lower=0.0)
+    national_cdd = (national_temp - 65.0).clip(lower=0.0)
+    hdd_anom = national_hdd - national_hdd.rolling(30, min_periods=10).mean()
+    cdd_anom = national_cdd - national_cdd.rolling(30, min_periods=10).mean()
+
+    out_cols = {
+        "national_avg_temp_f": national_temp,
+        "national_hdd": national_hdd,
+        "national_cdd": national_cdd,
+        "hdd_anomaly_30d": hdd_anom,
+        "cdd_anomaly_30d": cdd_anom,
+        # Preserve schema for the synthetic-trained model artifact: emit
+        # NaN columns for channels GHCND doesn't serve. Median imputer
+        # fills at training time, walk-forward selector prunes.
+        "national_wind_mph": pd.Series(float("nan"), index=df.index),
+        "national_humidity_pct": pd.Series(float("nan"), index=df.index),
+        "lng_terminal_avg_temp_f": pd.Series(float("nan"), index=df.index),
+        "lng_terminal_wind_mph": pd.Series(float("nan"), index=df.index),
+        "lng_terminal_storm_flag": pd.Series(0, index=df.index),
+        "gulf_max_wind_mph": pd.Series(float("nan"), index=df.index),
+        "gulf_storm_active": pd.Series(0, index=df.index),
+    }
+
+    # Per-region aggregates: same weighted-average logic, scoped to the
+    # stations tagged with that region.
+    regions = sorted({m.get("region") for m in name_to_meta.values()
+                       if m.get("region")})
+    for reg in regions:
+        members = [n for n, m in name_to_meta.items() if m.get("region") == reg]
+        if not members:
+            continue
+        reg_w = pd.Series({n: name_to_meta[n].get("weight", 0.0)
+                           for n in members})
+        reg_w_total = reg_w.sum() or 1.0
+        reg_w = reg_w / reg_w_total
+        reg_df = df[members]
+        reg_avail = reg_df.notna().astype(float) * reg_w
+        reg_vals = reg_df.fillna(0.0) * reg_w
+        reg_denom = reg_avail.sum(axis=1).replace(0.0, float("nan"))
+        reg_temp = reg_vals.sum(axis=1) / reg_denom
+        reg_hdd = (65.0 - reg_temp).clip(lower=0.0)
+        reg_cdd = (reg_temp - 65.0).clip(lower=0.0)
+        out_cols[f"region_{reg}_temp_f"] = reg_temp
+        out_cols[f"region_{reg}_hdd"] = reg_hdd
+        out_cols[f"region_{reg}_cdd"] = reg_cdd
+        out_cols[f"region_{reg}_hdd_anomaly_30d"] = (
+            reg_hdd - reg_hdd.rolling(30, min_periods=10).mean())
+        out_cols[f"region_{reg}_cdd_anomaly_30d"] = (
+            reg_cdd - reg_cdd.rolling(30, min_periods=10).mean())
+
+    return pd.DataFrame(out_cols).rename_axis("date")
 
 
 def _synthetic_national_weather(cfg: Config, days: int) -> pd.DataFrame:

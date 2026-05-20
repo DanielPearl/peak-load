@@ -168,15 +168,18 @@ class Config:
     # match EIA's natural-gas demand reporting groups (Northeast,
     # Midwest, South, West) plus a separate "Gulf" channel for the
     # production/LNG-export footprint that hurricanes hit.
+    # `noaa_id` is the GHCND identifier used by NOAA's Climate Data
+    # Online v2 API. Picked first-order airport stations with the
+    # longest TAVG/TMAX/TMIN coverage going back to 1997.
     weather_reference_stations: List[dict] = field(default_factory=lambda: [
-        {"name": "NYC",     "lat": 40.78, "lon": -73.97, "weight": 0.18, "region": "northeast"},
-        {"name": "Boston",  "lat": 42.36, "lon": -71.06, "weight": 0.07, "region": "northeast"},
-        {"name": "Chicago", "lat": 41.88, "lon": -87.63, "weight": 0.14, "region": "midwest"},
-        {"name": "Atlanta", "lat": 33.75, "lon": -84.39, "weight": 0.08, "region": "south"},
-        {"name": "Houston", "lat": 29.76, "lon": -95.36, "weight": 0.10, "region": "gulf"},
-        {"name": "Phoenix", "lat": 33.45, "lon": -112.07,"weight": 0.06, "region": "west"},
-        {"name": "Denver",  "lat": 39.74, "lon": -104.99,"weight": 0.05, "region": "west"},
-        {"name": "Seattle", "lat": 47.61, "lon": -122.33,"weight": 0.04, "region": "west"},
+        {"name": "NYC",     "lat": 40.78, "lon": -73.97, "weight": 0.18, "region": "northeast", "noaa_id": "GHCND:USW00094728"},
+        {"name": "Boston",  "lat": 42.36, "lon": -71.06, "weight": 0.07, "region": "northeast", "noaa_id": "GHCND:USW00014739"},
+        {"name": "Chicago", "lat": 41.88, "lon": -87.63, "weight": 0.14, "region": "midwest",   "noaa_id": "GHCND:USW00094846"},
+        {"name": "Atlanta", "lat": 33.75, "lon": -84.39, "weight": 0.08, "region": "south",     "noaa_id": "GHCND:USW00013874"},
+        {"name": "Houston", "lat": 29.76, "lon": -95.36, "weight": 0.10, "region": "gulf",      "noaa_id": "GHCND:USW00012960"},
+        {"name": "Phoenix", "lat": 33.45, "lon": -112.07,"weight": 0.06, "region": "west",      "noaa_id": "GHCND:USW00023183"},
+        {"name": "Denver",  "lat": 39.74, "lon": -104.99,"weight": 0.05, "region": "west",      "noaa_id": "GHCND:USW00003017"},
+        {"name": "Seattle", "lat": 47.61, "lon": -122.33,"weight": 0.04, "region": "west",      "noaa_id": "GHCND:USW00024233"},
     ])
 
     # LNG export-terminal weather stations. Tropical storms, fog, and
