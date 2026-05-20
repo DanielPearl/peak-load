@@ -64,16 +64,8 @@ def fetch_natgas_henry_hub(cfg: Config, days: int = 1095) -> pd.DataFrame:
 def _fetch_eia_henry_hub_real(cfg: Config, days: int) -> pd.DataFrame:
     end = datetime.now(timezone.utc).date()
     start = end - timedelta(days=days)
-    url = f"{EIA_BASE}/seriesid/NG.RNGWHHD.D"
-    params = {
-        "api_key": cfg.eia_api_key,
-        "start": start.isoformat(),
-        "end": end.isoformat(),
-        "length": 5000,
-    }
-    r = requests.get(url, params=params, timeout=30)
-    r.raise_for_status()
-    rows = r.json().get("response", {}).get("data", []) or []
+    rows = _fetch_eia_seriesid_paged(
+        cfg, "NG.RNGWHHD.D", start.isoformat(), end.isoformat())
     if not rows:
         raise RuntimeError("EIA Henry Hub returned no rows")
     df = pd.DataFrame(rows)
@@ -82,6 +74,42 @@ def _fetch_eia_henry_hub_real(cfg: Config, days: int) -> pd.DataFrame:
     return (df.set_index("period")[["value"]]
               .rename(columns={"value": "natgas_henry_hub_usd_mmbtu"})
               .sort_index())
+
+
+def _fetch_eia_seriesid_paged(cfg: Config, series_id: str,
+                                start: str, end: str,
+                                page_size: int = 5000) -> list:
+    """Paginate EIA's /seriesid endpoint past its per-request row cap.
+
+    EIA caps `length` at 5000 rows. 27 years of daily Henry Hub is
+    ~10500 rows, so a single call truncates the historical tail. Loop
+    with `offset` until a short page (< page_size) comes back.
+    """
+    url = f"{EIA_BASE}/seriesid/{series_id}"
+    offset = 0
+    out: list = []
+    while True:
+        params = {
+            "api_key": cfg.eia_api_key,
+            "start": start,
+            "end": end,
+            "length": page_size,
+            "offset": offset,
+        }
+        r = requests.get(url, params=params, timeout=30)
+        r.raise_for_status()
+        page = r.json().get("response", {}).get("data", []) or []
+        if not page:
+            break
+        out.extend(page)
+        if len(page) < page_size:
+            break
+        offset += page_size
+        # Hard cap to avoid runaway loops if EIA misbehaves.
+        if offset > 100000:
+            log.warning("EIA pagination hit safety cap at %d rows", offset)
+            break
+    return out
 
 
 def _synthetic_henry_hub(cfg: Config, days: int) -> pd.DataFrame:

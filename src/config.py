@@ -95,7 +95,12 @@ class Config:
 
     # ── Modeling ──────────────────────────────────────────────────────
     forecast_horizon_days: int = 1
-    history_days_for_training: int = 1095   # ~3 years of daily NG data
+    # Full EIA Henry Hub history goes back to 1997-01-07 (~10500 daily
+    # obs). 10000 captures roughly 27 years; the loader paginates past
+    # EIA's 5000-row per-request cap. Weather/storage/cross-Kalshi
+    # companion data thins out before ~2010, so the median imputer +
+    # walk-forward selector handle the partial-coverage early period.
+    history_days_for_training: int = 10000
     test_size_days: int = 120
     random_state: int = 42
 
@@ -221,7 +226,7 @@ def load_config() -> Config:
         kalshi_api_key_id=os.environ.get("KALSHI_API_KEY_ID", ""),
         kalshi_private_key_path=os.environ.get("KALSHI_PRIVATE_KEY_PATH", ""),
         forecast_horizon_days=int(os.environ.get("FORECAST_HORIZON_DAYS", "1")),
-        history_days_for_training=int(os.environ.get("HISTORY_DAYS", "1095")),
+        history_days_for_training=int(os.environ.get("HISTORY_DAYS", "10000")),
         test_size_days=int(os.environ.get("TEST_SIZE_DAYS", "120")),
         target_column=os.environ.get("TARGET_COLUMN",
                                        "natgas_henry_hub_usd_mmbtu"),
